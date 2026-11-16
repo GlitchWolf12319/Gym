@@ -3226,6 +3226,13 @@ function App() {
             <StatsView
               measurementHistory={measurementHistory}
               measurementUnit={measurementUnit}
+              archive={archive}
+              workout={workout}
+              programStartDate={programStartDate}
+              cycleLength={(() => {
+                const prog = PROGRAMS.find(p => p.id === selectedProgramId);
+                return prog ? Object.keys(prog.dayLabels || {}).length : 7;
+              })()}
               onChangeUnit={(nextUnit) => {
                 setMeasurementUnit(nextUnit);
                 triggerCloudSync();

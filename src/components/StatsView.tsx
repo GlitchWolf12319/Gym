@@ -1,11 +1,13 @@
 import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
-import { Check, TrendingDown, TrendingUp, Minus } from 'lucide-react';
-import { format, parseISO } from 'date-fns';
+import { Check, TrendingDown, TrendingUp, Minus, ArrowRight } from 'lucide-react';
+import { format, parseISO, differenceInDays, addDays, startOfWeek } from 'date-fns';
 import {
+  ArchiveEntry,
   BodyMeasurementEntry,
   MeasurementUnit,
   MuscleGroupKey,
+  WorkoutItem,
 } from '../types';
 
 interface MuscleDefinition {
@@ -90,6 +92,42 @@ interface StatsViewProps {
   onChangeUnit: (unit: MeasurementUnit) => void;
   onSaveEntry: (entry: BodyMeasurementEntry) => void;
   onDeleteEntry: (id: string) => void;
+  archive: ArchiveEntry[];
+  workout: WorkoutItem[];
+  programStartDate: string;
+  cycleLength?: number;
+}
+
+interface WeekExerciseAggregate {
+  key: string;
+  name: string;
+  totalVolume: number;
+  bestSessionVolume: number;
+  maxWeight: number;
+  weightUnit: string;
+  bestSetWeight: number;
+  bestSetReps: number;
+  best1RM: number;
+  bestSessionReps: number;
+  sessionsCount: number;
+}
+
+interface WeekBucket {
+  weekKey: string;
+  label: string;
+  dateRange: string;
+  sortTime: number;
+  totalVolume: number;
+  workoutDays: number;
+  exercises: Record<string, WeekExerciseAggregate>;
+}
+
+function parseWeightParts(raw: string | undefined): { value: number; unit: string } {
+  if (!raw) return { value: 0, unit: 'kg' };
+  const str = String(raw).trim();
+  const num = parseFloat(str.replace(/[^0-9.]/g, '')) || 0;
+  const unitMatch = str.match(/[a-zA-Z]+/);
+  return { value: num, unit: unitMatch ? unitMatch[0].toLowerCase() : 'kg' };
 }
 
 export const StatsView: React.FC<StatsViewProps> = ({
@@ -98,6 +136,10 @@ export const StatsView: React.FC<StatsViewProps> = ({
   onChangeUnit,
   onSaveEntry,
   onDeleteEntry,
+  archive,
+  workout,
+  programStartDate,
+  cycleLength = 7,
 }) => {
   const [todayStr, setTodayStr] = useState<string>(() => format(new Date(), 'yyyy-MM-dd'));
   const [activeDate, setActiveDate] = useState<string>(() => format(new Date(), 'yyyy-MM-dd'));
@@ -1031,6 +1073,561 @@ export const StatsView: React.FC<StatsViewProps> = ({
           )}
         </div>
       </div>
+
+      {/* Weekly Progressive Overload Comparison Box */}
+      {(() => {
+        // Combine archived workouts with today's live workout if not yet archived
+        const sessionsByDate = new Map<string, WorkoutItem[]>();
+        for (const entry of archive) {
+          if (entry.exercises && entry.exercises.length > 0) {
+            sessionsByDate.set(entry.date, entry.exercises);
+          }
+        }
+        if (workout.length > 0) {
+          const todayLive = workout.filter(
+            (ex) =>
+              ex.completed ||
+              (ex.setData &&
+                ex.setData.some((s) => parseWeightParts(s.weight || ex.weight).value > 0 && Number(s.reps) > 0))
+          );
+          if (todayLive.length > 0) {
+            sessionsByDate.set(todayStr, todayLive);
+          }
+        }
+
+        const safeCycle = Math.max(1, cycleLength || 7);
+        let parsedProgramStart: Date | null = null;
+        try {
+          if (programStartDate) parsedProgramStart = parseISO(programStartDate);
+        } catch {
+          parsedProgramStart = null;
+        }
+
+        const bucketsMap = new Map<string, WeekBucket>();
+
+        sessionsByDate.forEach((exercises, dateStr) => {
+          let entryDate: Date;
+          try {
+            entryDate = parseISO(dateStr);
+            if (isNaN(entryDate.getTime())) return;
+          } catch {
+            return;
+          }
+
+          let weekKey = '';
+          let label = '';
+          let dateRange = '';
+          let sortTime = entryDate.getTime();
+
+          if (parsedProgramStart && !isNaN(parsedProgramStart.getTime())) {
+            const diffDays = differenceInDays(entryDate, parsedProgramStart);
+            if (diffDays >= 0) {
+              const weekNum = Math.floor(diffDays / safeCycle) + 1;
+              const startD = addDays(parsedProgramStart, (weekNum - 1) * safeCycle);
+              const endD = addDays(startD, safeCycle - 1);
+              weekKey = `P-${weekNum}`;
+              label = `Week ${weekNum}`;
+              dateRange = `${format(startD, 'MMM d')} – ${format(endD, 'MMM d')}`;
+              sortTime = startD.getTime();
+            }
+          }
+
+          if (!weekKey) {
+            const weekStart = startOfWeek(entryDate, { weekStartsOn: 1 });
+            const weekEnd = addDays(weekStart, 6);
+            weekKey = `C-${format(weekStart, 'yyyy-MM-dd')}`;
+            label = `Week of ${format(weekStart, 'MMM d')}`;
+            dateRange = `${format(weekStart, 'MMM d')} – ${format(weekEnd, 'MMM d')}`;
+            sortTime = weekStart.getTime();
+          }
+
+          if (!bucketsMap.has(weekKey)) {
+            bucketsMap.set(weekKey, {
+              weekKey,
+              label,
+              dateRange,
+              sortTime,
+              totalVolume: 0,
+              workoutDays: 0,
+              exercises: {},
+            });
+          }
+
+          const bucket = bucketsMap.get(weekKey)!;
+          let sessionHasValidExercise = false;
+
+          for (const ex of exercises) {
+            if (!ex.name) continue;
+            const setsList =
+              ex.setData && ex.setData.length > 0
+                ? ex.setData
+                : Array.from({ length: parseInt(String(ex.sets || '1')) || 1 }, () => ({
+                    weight: ex.weight,
+                    reps: ex.reps,
+                  }));
+
+            let sessionVolume = 0;
+            let sessionReps = 0;
+            let sessionMaxWeight = 0;
+            let bestSetWeight = 0;
+            let bestSetReps = 0;
+            let bestSetScore = -1;
+            let best1RM = 0;
+            let weightUnit = 'kg';
+
+            for (const s of setsList) {
+              const { value: w, unit } = parseWeightParts(s.weight || ex.weight);
+              const r = Number(s.reps ?? ex.reps) || 0;
+              if (w > 0) weightUnit = unit;
+              const setVol = w * r;
+              sessionVolume += setVol;
+              sessionReps += r;
+              if (w > sessionMaxWeight) sessionMaxWeight = w;
+              const score = w > 0 ? setVol : r;
+              if (score > bestSetScore) {
+                bestSetScore = score;
+                bestSetWeight = w;
+                bestSetReps = r;
+              }
+              if (w > 0 && r > 0) {
+                const e1rm = w * (1 + r / 30);
+                if (e1rm > best1RM) best1RM = e1rm;
+              }
+            }
+
+            if (!ex.completed && sessionVolume === 0) continue;
+            if (sessionVolume === 0 && sessionReps === 0) continue;
+
+            sessionHasValidExercise = true;
+            const exKey = ex.name.trim().toUpperCase();
+            const prevAgg = bucket.exercises[exKey];
+
+            if (!prevAgg) {
+              bucket.exercises[exKey] = {
+                key: exKey,
+                name: ex.name,
+                totalVolume: sessionVolume,
+                bestSessionVolume: sessionVolume,
+                maxWeight: sessionMaxWeight,
+                weightUnit,
+                bestSetWeight,
+                bestSetReps,
+                best1RM,
+                bestSessionReps: sessionReps,
+                sessionsCount: 1,
+              };
+            } else {
+              prevAgg.totalVolume += sessionVolume;
+              prevAgg.sessionsCount += 1;
+              if (sessionVolume > prevAgg.bestSessionVolume) {
+                prevAgg.bestSessionVolume = sessionVolume;
+                prevAgg.bestSetWeight = bestSetWeight;
+                prevAgg.bestSetReps = bestSetReps;
+              }
+              if (sessionMaxWeight > prevAgg.maxWeight) {
+                prevAgg.maxWeight = sessionMaxWeight;
+              }
+              if (best1RM > prevAgg.best1RM) {
+                prevAgg.best1RM = best1RM;
+              }
+              if (sessionReps > prevAgg.bestSessionReps) {
+                prevAgg.bestSessionReps = sessionReps;
+              }
+            }
+
+            bucket.totalVolume += sessionVolume;
+          }
+
+          if (sessionHasValidExercise) {
+            bucket.workoutDays += 1;
+          }
+        });
+
+        const weeks = Array.from(bucketsMap.values())
+          .filter((w) => Object.keys(w.exercises).length > 0)
+          .sort((a, b) => a.sortTime - b.sortTime);
+
+        return (
+          <WeeklyOverloadBox weeks={weeks} />
+        );
+      })()}
     </motion.div>
   );
 };
+
+const WeeklyOverloadBox: React.FC<{ weeks: WeekBucket[] }> = ({ weeks }) => {
+  const [weekAKey, setWeekAKey] = useState<string>('');
+  const [weekBKey, setWeekBKey] = useState<string>('');
+
+  useEffect(() => {
+    if (weeks.length === 0) return;
+    const latest = weeks[weeks.length - 1].weekKey;
+    const prev = weeks.length >= 2 ? weeks[weeks.length - 2].weekKey : latest;
+
+    if (!weekBKey || !weeks.some((w) => w.weekKey === weekBKey)) {
+      setWeekBKey(latest);
+    }
+    if (!weekAKey || !weeks.some((w) => w.weekKey === weekAKey)) {
+      setWeekAKey(prev);
+    }
+  }, [weeks, weekAKey, weekBKey]);
+
+  const weekA = weeks.find((w) => w.weekKey === weekAKey) || weeks[Math.max(0, weeks.length - 2)];
+  const weekB = weeks.find((w) => w.weekKey === weekBKey) || weeks[weeks.length - 1];
+
+  const comparisons = useMemo(() => {
+    if (!weekA || !weekB) return [];
+
+    const allKeys = Array.from(
+      new Set([...Object.keys(weekB.exercises), ...Object.keys(weekA.exercises)])
+    );
+
+    return allKeys
+      .map((exKey) => {
+        const a = weekA.exercises[exKey];
+        const b = weekB.exercises[exKey];
+
+        if (a && b) {
+          const usingWeight = a.maxWeight > 0 || b.maxWeight > 0;
+          let pct = 0;
+          let status: 'improving' | 'backwards' | 'same' = 'same';
+
+          if (usingWeight) {
+            if (a.bestSessionVolume > 0) {
+              pct = ((b.bestSessionVolume - a.bestSessionVolume) / a.bestSessionVolume) * 100;
+            }
+            if (
+              b.bestSessionVolume > a.bestSessionVolume + 0.01 ||
+              b.maxWeight > a.maxWeight + 0.01 ||
+              (b.maxWeight === a.maxWeight && b.bestSessionReps > a.bestSessionReps)
+            ) {
+              status = 'improving';
+            } else if (
+              b.bestSessionVolume < a.bestSessionVolume - 0.01 ||
+              b.maxWeight < a.maxWeight - 0.01
+            ) {
+              status = 'backwards';
+            }
+          } else {
+            if (a.bestSessionReps > 0) {
+              pct = ((b.bestSessionReps - a.bestSessionReps) / a.bestSessionReps) * 100;
+            }
+            if (b.bestSessionReps > a.bestSessionReps) status = 'improving';
+            else if (b.bestSessionReps < a.bestSessionReps) status = 'backwards';
+          }
+
+          return {
+            key: exKey,
+            name: b.name || a.name,
+            a,
+            b,
+            pct,
+            status: status as 'improving' | 'backwards' | 'same' | 'only-a' | 'only-b',
+          };
+        }
+
+        if (b && !a) {
+          return {
+            key: exKey,
+            name: b.name,
+            a: undefined,
+            b,
+            pct: 0,
+            status: 'only-b' as const,
+          };
+        }
+
+        return {
+          key: exKey,
+          name: a!.name,
+          a,
+          b: undefined,
+          pct: 0,
+          status: 'only-a' as const,
+        };
+      })
+      .sort((x, y) => {
+        const rank = (s: string) =>
+          s === 'improving' ? 0 : s === 'backwards' ? 1 : s === 'same' ? 2 : 3;
+        return rank(x.status) - rank(y.status);
+      });
+  }, [weekA, weekB]);
+
+  const matched = comparisons.filter(
+    (c) => c.status === 'improving' || c.status === 'backwards' || c.status === 'same'
+  );
+  const improvedCount = matched.filter((c) => c.status === 'improving').length;
+  const backwardsCount = matched.filter((c) => c.status === 'backwards').length;
+  const sameCount = matched.filter((c) => c.status === 'same').length;
+  const avgOverloadPct =
+    matched.length > 0
+      ? matched.reduce((acc, c) => acc + c.pct, 0) / matched.length
+      : 0;
+
+  let overallVerdict: 'improving' | 'backwards' | 'same' = 'same';
+  if (matched.length > 0) {
+    if (avgOverloadPct > 0.25 || (avgOverloadPct >= 0 && improvedCount > backwardsCount)) {
+      overallVerdict = 'improving';
+    } else if (avgOverloadPct < -0.25 || (avgOverloadPct <= 0 && backwardsCount > improvedCount)) {
+      overallVerdict = 'backwards';
+    }
+  }
+
+  const maxWeekVol = Math.max(1, ...weeks.map((w) => w.totalVolume));
+
+  const formatBest = (agg?: WeekExerciseAggregate) => {
+    if (!agg) return '--';
+    if (agg.bestSetWeight > 0) {
+      return `${agg.bestSetWeight}${agg.weightUnit} × ${agg.bestSetReps}`;
+    }
+    return `${agg.bestSessionReps} reps`;
+  };
+
+  return (
+    <div className="bg-surface-container-low border border-white/5 p-4 md:p-6 space-y-5">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h3 className="font-sans font-semibold text-base md:text-lg font-bold text-on-surface">
+            Weekly Progressive Overload
+          </h3>
+          <p className="text-xs text-on-surface-variant mt-0.5">
+            Compare any two weeks to see if your lifts are improving or going backwards
+          </p>
+        </div>
+
+        {weeks.length >= 2 && weekA && weekB && (
+          <div className="flex items-center gap-2 flex-wrap">
+            <select
+              value={weekA.weekKey}
+              onChange={(e) => setWeekAKey(e.target.value)}
+              aria-label="Baseline week"
+              className="bg-surface-container-high border border-white/10 rounded-xl px-3 py-2 text-xs font-mono font-semibold text-on-surface focus:border-primary-container outline-none min-h-[40px]"
+            >
+              {weeks.map((w) => (
+                <option key={w.weekKey} value={w.weekKey}>
+                  {w.label}
+                </option>
+              ))}
+            </select>
+            <ArrowRight className="w-4 h-4 text-on-surface-variant shrink-0" />
+            <select
+              value={weekB.weekKey}
+              onChange={(e) => setWeekBKey(e.target.value)}
+              aria-label="Comparison week"
+              className="bg-surface-container-high border border-primary-container/40 rounded-xl px-3 py-2 text-xs font-mono font-semibold text-primary-container focus:border-primary-container outline-none min-h-[40px]"
+            >
+              {weeks.map((w) => (
+                <option key={w.weekKey} value={w.weekKey}>
+                  {w.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {weeks.length === 0 ? (
+        <div className="bg-background/60 border border-white/5 rounded-2xl p-8 text-center">
+          <div className="text-sm font-semibold text-on-surface">No workout history logged yet</div>
+          <p className="text-xs text-on-surface-variant mt-1">
+            Complete workouts in Quest or Schedule with your weights and reps to compare weekly overload.
+          </p>
+        </div>
+      ) : weeks.length === 1 ? (
+        <div className="bg-background/60 border border-white/5 rounded-2xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <div className="text-sm font-bold text-primary-container">
+              {weeks[0].label} Baseline Recorded ({weeks[0].dateRange})
+            </div>
+            <div className="text-xs text-on-surface-variant mt-1">
+              {Object.keys(weeks[0].exercises).length} exercises logged · Total volume{' '}
+              <span className="font-mono text-on-surface font-semibold">
+                {Math.round(weeks[0].totalVolume).toLocaleString()} kg
+              </span>
+            </div>
+          </div>
+          <div className="text-xs text-on-surface-variant">
+            Log workouts next week to compare progression.
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* Clickable Week-by-Week Trend Strip */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2.5">
+            {weeks.map((w, idx) => {
+              const prevW = idx > 0 ? weeks[idx - 1] : null;
+              const volDeltaPct =
+                prevW && prevW.totalVolume > 0
+                  ? ((w.totalVolume - prevW.totalVolume) / prevW.totalVolume) * 100
+                  : null;
+              const isSelectedB = weekB?.weekKey === w.weekKey;
+              const isSelectedA = weekA?.weekKey === w.weekKey;
+              const barPct = Math.max(10, Math.round((w.totalVolume / maxWeekVol) * 100));
+
+              return (
+                <button
+                  key={w.weekKey}
+                  type="button"
+                  onClick={() => {
+                    setWeekBKey(w.weekKey);
+                    if (idx > 0) setWeekAKey(weeks[idx - 1].weekKey);
+                  }}
+                  className={`text-left p-3 rounded-xl border transition-all ${
+                    isSelectedB
+                      ? 'bg-primary-container/15 border-primary-container/60'
+                      : isSelectedA
+                        ? 'bg-surface-container-high border-white/25'
+                        : 'bg-background/50 border-white/5 hover:border-white/15'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-mono text-xs font-bold text-on-surface">{w.label}</span>
+                    {volDeltaPct !== null && (
+                      <span
+                        className={`font-mono text-[10px] font-bold ${
+                          volDeltaPct > 0.5
+                            ? 'text-emerald-400'
+                            : volDeltaPct < -0.5
+                              ? 'text-error'
+                              : 'text-on-surface-variant'
+                        }`}
+                      >
+                        {volDeltaPct > 0 ? '+' : ''}
+                        {volDeltaPct.toFixed(0)}%
+                      </span>
+                    )}
+                  </div>
+                  <div className="font-mono tabular-nums text-xs text-on-surface-variant mt-1">
+                    {Math.round(w.totalVolume).toLocaleString()} kg
+                  </div>
+                  <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden mt-2">
+                    <div
+                      className={`h-full rounded-full ${
+                        isSelectedB ? 'bg-primary-container' : 'bg-primary-container/45'
+                      }`}
+                      style={{ width: `${barPct}%` }}
+                    />
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Verdict Banner */}
+          {weekA && weekB && (
+            <div className="bg-background/60 border border-white/5 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                {overallVerdict === 'improving' ? (
+                  <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
+                    <TrendingUp className="w-5 h-5" />
+                  </div>
+                ) : overallVerdict === 'backwards' ? (
+                  <div className="w-10 h-10 rounded-xl bg-error/15 border border-error/30 flex items-center justify-center text-error shrink-0">
+                    <TrendingDown className="w-5 h-5" />
+                  </div>
+                ) : (
+                  <div className="w-10 h-10 rounded-xl bg-primary-container/15 border border-primary-container/30 flex items-center justify-center text-primary-container shrink-0">
+                    <Minus className="w-5 h-5" />
+                  </div>
+                )}
+
+                <div>
+                  <div
+                    className={`text-sm font-bold ${
+                      overallVerdict === 'improving'
+                        ? 'text-emerald-400'
+                        : overallVerdict === 'backwards'
+                          ? 'text-error'
+                          : 'text-primary-container'
+                    }`}
+                  >
+                    {overallVerdict === 'improving'
+                      ? `Improving (${avgOverloadPct >= 0 ? '+' : ''}${avgOverloadPct.toFixed(1)}% avg overload)`
+                      : overallVerdict === 'backwards'
+                        ? `Going Backwards (${avgOverloadPct.toFixed(1)}% avg overload)`
+                        : matched.length > 0
+                          ? 'Maintained (0.0% change)'
+                          : 'No shared exercises between these weeks'}
+                  </div>
+                  <div className="text-xs text-on-surface-variant mt-0.5 font-mono">
+                    {weekA.label} ({Math.round(weekA.totalVolume).toLocaleString()} kg) → {weekB.label} (
+                    {Math.round(weekB.totalVolume).toLocaleString()} kg)
+                  </div>
+                </div>
+              </div>
+
+              {matched.length > 0 && (
+                <div className="flex items-center gap-3 text-xs font-mono">
+                  <span className="text-emerald-400">{improvedCount} Up</span>
+                  <span className="text-on-surface-variant/40">·</span>
+                  <span className="text-on-surface-variant">{sameCount} Same</span>
+                  <span className="text-on-surface-variant/40">·</span>
+                  <span className="text-error">{backwardsCount} Down</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Exercise-by-Exercise Breakdown */}
+          {comparisons.length > 0 && (
+            <div className="divide-y divide-white/5 max-h-[340px] overflow-y-auto pr-1 custom-scrollbar">
+              {comparisons.map((row) => (
+                <div
+                  key={row.key}
+                  className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                >
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-on-surface truncate">
+                      {row.name}
+                    </div>
+                    <div className="text-xs font-mono text-on-surface-variant mt-0.5 flex items-center gap-2 flex-wrap">
+                      <span>
+                        {weekA?.label}: <strong className="text-on-surface">{formatBest(row.a)}</strong>
+                      </span>
+                      <span className="text-on-surface-variant/40">→</span>
+                      <span>
+                        {weekB?.label}: <strong className="text-on-surface">{formatBest(row.b)}</strong>
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="shrink-0 font-mono text-xs font-bold flex items-center gap-1.5">
+                    {row.status === 'improving' && (
+                      <span className="text-emerald-400 flex items-center gap-1">
+                        <TrendingUp className="w-3.5 h-3.5" />
+                        Improving{row.pct !== 0 ? ` (+${Math.abs(row.pct).toFixed(1)}%)` : ''}
+                      </span>
+                    )}
+                    {row.status === 'backwards' && (
+                      <span className="text-error flex items-center gap-1">
+                        <TrendingDown className="w-3.5 h-3.5" />
+                        Backwards{row.pct !== 0 ? ` (${row.pct.toFixed(1)}%)` : ''}
+                      </span>
+                    )}
+                    {row.status === 'same' && (
+                      <span className="text-primary-container flex items-center gap-1">
+                        <Minus className="w-3.5 h-3.5" />
+                        Same
+                      </span>
+                    )}
+                    {row.status === 'only-b' && (
+                      <span className="text-on-surface-variant font-normal">
+                        Only in {weekB?.label}
+                      </span>
+                    )}
+                    {row.status === 'only-a' && (
+                      <span className="text-on-surface-variant font-normal">
+                        Not logged in {weekB?.label}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
