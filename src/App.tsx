@@ -1,0 +1,4216 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { Component, useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { 
+  Bolt, 
+  History, 
+  Calendar as CalendarIcon, 
+  BarChart3, 
+  AlertTriangle, 
+  Check, 
+  CheckCircle2, 
+  Lock, 
+  Rocket,
+  Trophy,
+  ChevronRight,
+  ChevronDown,
+  LayoutList,
+  Terminal,
+  Settings,
+  ChevronLeft,
+  TrendingUp,
+  Activity,
+  Zap,
+  Shield,
+  Target,
+  LogOut,
+  User as UserIcon,
+  Loader2,
+  LogIn,
+  Cloud,
+  CloudOff,
+  RefreshCw,
+  Clock,
+  XCircle,
+  Plus,
+  Trash2,
+  Scale,
+  Utensils,
+  TrendingDown,
+  Edit2,
+  Play,
+  Youtube,
+  X
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  format, 
+  startOfMonth, 
+  endOfMonth, 
+  startOfWeek, 
+  endOfWeek, 
+  eachDayOfInterval, 
+  isSameMonth, 
+  isSameDay, 
+  addMonths, 
+  subMonths,
+  parseISO,
+  differenceInDays
+} from 'date-fns';
+import { 
+  WorkoutItem, 
+  ScheduleDay, 
+  WeeklySchedule,
+  ArchiveEntry, 
+  WeightEntry,
+  WorkoutSet,
+  BodyMeasurementEntry,
+  MeasurementUnit
+} from './types';
+import { PROGRAMS, Program, WEAKPOINT_MAPPING } from './data/programs';
+import { ExerciseVisual } from './components/ExerciseVisual';
+import { StatsView } from './components/StatsView';
+import { auth, db, googleProvider } from './firebase';
+import { 
+  onAuthStateChanged, 
+  signInWithPopup, 
+  signOut, 
+  User 
+} from 'firebase/auth';
+import { 
+  doc, 
+  getDoc, 
+  setDoc, 
+  onSnapshot,
+  getDocFromServer
+} from 'firebase/firestore';
+import { videoIds } from './videos';
+import videoTitles from '../video_titles.json';
+
+// Error Handling Spec for Firestore Operations
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+// Error Boundary Component
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  errorInfo: string | null;
+}
+
+class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { hasError: false, errorInfo: null };
+  props: ErrorBoundaryProps;
+
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, errorInfo: error.message };
+  }
+
+  componentDidCatch(error: any, errorInfo: any) {
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-background flex items-center justify-center p-8">
+          <div className="max-w-md w-full bg-surface-container-low border border-error/30 p-8 text-center">
+            <AlertTriangle className="w-12 h-12 text-error mx-auto mb-4" />
+            <h2 className="font-sans font-semibold text-xl font-bold text-on-surface   mb-2">System Critical Error</h2>
+            <p className="text-on-surface-variant text-xs   mb-6 leading-relaxed">
+              The protocol has encountered a fatal exception. Please refresh or contact support.
+            </p>
+            <div className="bg-error/5 p-4 mb-6 text-left overflow-auto max-h-32">
+              <code className="text-sm text-error font-mono break-all">{this.state.errorInfo}</code>
+            </div>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full bg-primary-container text-on-primary-container font-sans font-semibold text-sm font-bold   py-3 hover:brightness-110 transition-all"
+            >
+              Reboot System
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const DAYS = ['Day 1', 'Day 2', 'Day 3', 'Day 4', 'Day 5', 'Day 6', 'Day 7', 'Day 8', 'Day 9', 'Day 10'];
+
+const INITIAL_SCHEDULE: ScheduleDay[] = DAYS.map(day => ({
+  day,
+  exercises: []
+}));
+
+const INITIAL_WORKOUT: WorkoutItem[] = [];
+
+function normalizeSchedule(fetchedSchedule: any): WeeklySchedule {
+  if (!fetchedSchedule) {
+    return { 1: INITIAL_SCHEDULE };
+  }
+  
+  let normalizedSchedule: WeeklySchedule = {};
+  
+  if (Array.isArray(fetchedSchedule)) {
+    fetchedSchedule.forEach((item, index) => {
+      if (!item) return;
+      
+      if (Array.isArray(item)) {
+        const validDays = item.filter(d => d && typeof d === 'object' && typeof d.day === 'string');
+        if (validDays.length > 0) {
+          normalizedSchedule[index] = validDays;
+        }
+      } else if (typeof item === 'object' && typeof item.day === 'string') {
+        if (!normalizedSchedule[1]) {
+          normalizedSchedule[1] = [];
+        }
+        normalizedSchedule[1].push(item);
+      }
+    });
+  } else if (typeof fetchedSchedule === 'object' && fetchedSchedule !== null) {
+    Object.entries(fetchedSchedule).forEach(([key, val]) => {
+      const weekNum = parseInt(key);
+      if (!isNaN(weekNum) && Array.isArray(val)) {
+        const validDays = val.filter(d => d && typeof d === 'object' && typeof d.day === 'string');
+        normalizedSchedule[weekNum] = validDays;
+      }
+    });
+  }
+  
+  if (Object.keys(normalizedSchedule).length === 0) {
+    normalizedSchedule = { 1: INITIAL_SCHEDULE };
+  }
+  
+  return normalizedSchedule;
+}
+
+// Helper to recursively remove any undefined values before sending to Firestore
+function sanitizeFirestoreData(data: any): any {
+  if (data === undefined) return null;
+  if (data === null) return null;
+  if (Array.isArray(data)) {
+    return data.map(sanitizeFirestoreData);
+  }
+  if (typeof data === 'object') {
+    const cleaned: any = {};
+    for (const key of Object.keys(data)) {
+      if (data[key] !== undefined) {
+        cleaned[key] = sanitizeFirestoreData(data[key]);
+      }
+    }
+    return cleaned;
+  }
+  return data;
+}
+
+export default function AppWrapper() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [hasInitialSyncCompleted, setHasInitialSyncCompleted] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  const [workout, setWorkout] = useState<WorkoutItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('sovereign_workout');
+      return saved ? JSON.parse(saved) : INITIAL_WORKOUT;
+    } catch (e) {
+      console.error("Failed to parse workout from localStorage", e);
+      return INITIAL_WORKOUT;
+    }
+  });
+  const [schedule, setSchedule] = useState<WeeklySchedule>(() => {
+    try {
+      const saved = localStorage.getItem('sovereign_schedule');
+      if (saved) {
+        return normalizeSchedule(JSON.parse(saved));
+      }
+      return { 1: INITIAL_SCHEDULE };
+    } catch (e) {
+      console.error("Failed to parse schedule from localStorage", e);
+      return { 1: INITIAL_SCHEDULE };
+    }
+  });
+  const [currentWeekTab, setCurrentWeekTab] = useState<number>(1);
+  const [archive, setArchive] = useState<ArchiveEntry[]>(() => {
+    try {
+      const saved = localStorage.getItem('sovereign_archive');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      console.error("Failed to parse archive from localStorage", e);
+      return [];
+    }
+  });
+  const [exp, setExp] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_exp');
+    return saved ? parseInt(saved) : 0;
+  });
+  const [programDuration, setProgramDuration] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_program_duration');
+    return saved ? parseInt(saved) : 4;
+  });
+  const [programStartDate, setProgramStartDate] = useState<string>(() => {
+    const saved = localStorage.getItem('sovereign_program_start_date');
+    return saved ? saved : format(new Date(), 'yyyy-MM-dd');
+  });
+  const [currentWeight, setCurrentWeight] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_current_weight');
+    return saved ? parseFloat(saved) : 75;
+  });
+  const [targetWeight, setTargetWeight] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_target_weight');
+    return saved ? parseFloat(saved) : 80;
+  });
+  const [nutritionGoal, setNutritionGoal] = useState<'CUT' | 'BULK' | 'MAINTAIN'>(() => {
+    const saved = localStorage.getItem('sovereign_nutrition_goal');
+    return (saved as any) || 'MAINTAIN';
+  });
+  const [proteinPerKg, setProteinPerKg] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_protein_per_kg');
+    return saved ? parseFloat(saved) : 2.0;
+  });
+  const [selectedProgramId, setSelectedProgramId] = useState<string | null>(() => {
+    return localStorage.getItem('sovereign_selected_program_id');
+  });
+  const [weakpointFocus, setWeakpointFocus] = useState<string | null>(() => {
+    return localStorage.getItem('sovereign_weakpoint_focus');
+  });
+  const [isProgramModalOpen, setIsProgramModalOpen] = useState(false);
+  const [isWeakpointModalOpen, setIsWeakpointModalOpen] = useState(false);
+  const [isScheduleConfigModalOpen, setIsScheduleConfigModalOpen] = useState(false);
+  const [dayMapping, setDayMapping] = useState<{[key: string]: string}>(() => {
+    const saved = localStorage.getItem('sovereign_day_mapping');
+    return saved ? JSON.parse(saved) : {
+      'Day 1': 'Day 1',
+      'Day 2': 'Day 2',
+      'Day 3': 'Day 3',
+      'Day 4': 'Day 4',
+      'Day 5': 'Day 5',
+      'Day 6': 'Day 6',
+      'Day 7': 'Day 7',
+      'Day 8': 'Day 8',
+      'Day 9': 'Day 9',
+      'Day 10': 'Day 10'
+    };
+  });
+  const [pendingProgramId, setPendingProgramId] = useState<string | null>(null);
+  const [pendingStartDate, setPendingStartDate] = useState<string>(() => format(new Date(), 'yyyy-MM-dd'));
+  const [isRepeatSchedule, setIsRepeatSchedule] = useState(true);
+  const [customScheduleStartDate, setCustomScheduleStartDate] = useState<string>(() => {
+    return localStorage.getItem('sovereign_custom_schedule_start_date') || format(new Date(), 'yyyy-MM-dd');
+  });
+  const [isRoadmapOpen, setIsRoadmapOpen] = useState(false);
+  const [isRpeOpen, setIsRpeOpen] = useState(false);
+  const [isPhaseOpen, setIsPhaseOpen] = useState(false);
+  const [isCardioOpen, setIsCardioOpen] = useState(false);
+  const [isProtocolDropdownOpen, setIsProtocolDropdownOpen] = useState(false);
+  const [activeVideoUrl, setActiveVideoUrl] = useState<string | null>(null);
+  const [videoSearch, setVideoSearch] = useState<string>('');
+  const [nutritionStartDate, setNutritionStartDate] = useState<string>(() => {
+    const saved = localStorage.getItem('sovereign_nutrition_start_date');
+    return saved ? saved : format(new Date(), 'yyyy-MM-dd');
+  });
+  const [nutritionDurationWeeks, setNutritionDurationWeeks] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_nutrition_duration_weeks');
+    return saved ? parseInt(saved) : 12;
+  });
+  const [calories, setCalories] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_calories');
+    return saved ? parseInt(saved) : 2500;
+  });
+  const [isAutoCalories, setIsAutoCalories] = useState<boolean>(() => {
+    const saved = localStorage.getItem('sovereign_auto_calories');
+    return saved === null ? true : saved === 'true';
+  });
+  const [isEditingGoal, setIsEditingGoal] = useState(false);
+  const [weightInput, setWeightInput] = useState<string>('');
+  const [bodyFat, setBodyFat] = useState<number>(() => {
+    const saved = localStorage.getItem('sovereign_body_fat');
+    return saved ? parseFloat(saved) : 15;
+  });
+  const [bodyFatInput, setBodyFatInput] = useState<string>('');
+  const [cardioCompleted, setCardioCompleted] = useState<boolean>(() => {
+    const saved = localStorage.getItem('sovereign_cardio_completed');
+    return saved === 'true';
+  });
+  const [weightHistory, setWeightHistory] = useState<WeightEntry[]>(() => {
+    try {
+      const saved = localStorage.getItem('sovereign_weight_history');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+  const [measurementHistory, setMeasurementHistory] = useState<BodyMeasurementEntry[]>(() => {
+    try {
+      const saved = localStorage.getItem('sovereign_measurement_history');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
+  const [measurementUnit, setMeasurementUnit] = useState<MeasurementUnit>(() => {
+    const saved = localStorage.getItem('sovereign_measurement_unit');
+    return saved === 'in' ? 'in' : 'cm';
+  });
+  const theme = 'cyan' as const;
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', 'cyan');
+    try {
+      localStorage.setItem('sovereign_theme', 'cyan');
+    } catch (e) {
+      console.error("Failed to save theme to localStorage", e);
+    }
+  }, []);
+
+  // Adaptive Caloric Engine
+  useEffect(() => {
+    if (isAutoCalories && weightHistory.length >= 7) {
+      const sortedHistory = [...weightHistory].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      const recentWeights = sortedHistory.slice(0, 7);
+      
+      if (recentWeights.length === 7) {
+        const avgRecent = recentWeights.reduce((acc, curr) => acc + curr.weight, 0) / 7;
+        const olderWeights = sortedHistory.slice(7, 14);
+        
+        if (olderWeights.length === 7) {
+          const avgOlder = olderWeights.reduce((acc, curr) => acc + curr.weight, 0) / 7;
+          const weeklyChange = avgRecent - avgOlder;
+          
+          let adjustment = 0;
+          if (nutritionGoal === 'CUT') {
+            // Target: -0.5kg to -1kg per week
+            if (weeklyChange > -0.3) adjustment = -100; // Not losing fast enough
+            else if (weeklyChange < -1.2) adjustment = 100; // Losing too fast
+          } else if (nutritionGoal === 'BULK') {
+            // Target: +0.25kg to +0.5kg per week
+            if (weeklyChange < 0.1) adjustment = 100; // Not gaining enough
+            else if (weeklyChange > 0.6) adjustment = -100; // Gaining too much fat
+          }
+          
+          if (adjustment !== 0) {
+            setCalories(prev => prev + adjustment);
+          }
+        }
+      }
+    }
+  }, [weightHistory, nutritionGoal, isAutoCalories]);
+
+  // Keep schedule phase in sync with nutrition goal
+  useEffect(() => {
+    if (!hasInitialSyncCompleted) return;
+    setSchedule(prev => {
+      const newSchedule: WeeklySchedule = {};
+      Object.keys(prev).forEach(week => {
+        const weekNum = parseInt(week);
+        newSchedule[weekNum] = prev[weekNum].map(day => ({ ...day, phase: nutritionGoal }));
+      });
+      return newSchedule;
+    });
+  }, [nutritionGoal, hasInitialSyncCompleted]);
+
+  const [lastChecked, setLastChecked] = useState<string | null>(() => {
+    return localStorage.getItem('sovereign_last_checked');
+  });
+
+  // Auth Listener
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Firestore Connection Test
+  useEffect(() => {
+    async function testConnection() {
+      try {
+        await getDocFromServer(doc(db, 'test', 'connection'));
+      } catch (error) {
+        if(error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration. ");
+          setSyncError("Cloud connection offline. Check network.");
+        }
+      }
+    }
+    testConnection();
+  }, []);
+
+  // Firestore Sync - Load Data
+  useEffect(() => {
+    if (!isAuthReady || !user) return;
+
+    const userDocRef = doc(db, 'users', user.uid);
+    setIsSyncing(true);
+
+    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+      // If the snapshot has pending writes, it means it's a local echo of a change we just made.
+      // We already have this data in our React state, so we skip to avoid "flickering" or reverts.
+      if (docSnap.metadata.hasPendingWrites) return;
+
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        
+        // Only update if the data is actually different to prevent unnecessary re-renders
+        // and potential race conditions with local state updates.
+        setWorkout(prev => (data.workout && JSON.stringify(prev) !== JSON.stringify(data.workout)) ? data.workout : prev);
+        setSchedule(prev => {
+          if (!data.schedule) return prev;
+          const normalized = normalizeSchedule(data.schedule);
+          return JSON.stringify(prev) !== JSON.stringify(normalized) ? normalized : prev;
+        });
+        setArchive(prev => (data.archive && JSON.stringify(prev) !== JSON.stringify(data.archive)) ? data.archive : prev);
+        setExp(prev => (data.exp !== undefined && prev !== data.exp) ? data.exp : prev);
+        setProgramDuration(prev => (data.programDuration !== undefined && prev !== data.programDuration) ? data.programDuration : prev);
+        setProgramStartDate(prev => (data.programStartDate !== undefined && prev !== data.programStartDate) ? data.programStartDate : prev);
+        setLastChecked(prev => (data.lastChecked !== undefined && prev !== data.lastChecked) ? data.lastChecked : prev);
+        setCurrentWeight(prev => (data.currentWeight !== undefined && prev !== data.currentWeight) ? data.currentWeight : prev);
+        setTargetWeight(prev => (data.targetWeight !== undefined && prev !== data.targetWeight) ? data.targetWeight : prev);
+        setNutritionGoal(prev => (data.nutritionGoal !== undefined && prev !== data.nutritionGoal) ? data.nutritionGoal : prev);
+        setProteinPerKg(prev => (data.proteinPerKg !== undefined && prev !== data.proteinPerKg) ? data.proteinPerKg : prev);
+        setNutritionStartDate(prev => (data.nutritionStartDate !== undefined && prev !== data.nutritionStartDate) ? data.nutritionStartDate : prev);
+        setNutritionDurationWeeks(prev => (data.nutritionDurationWeeks !== undefined && prev !== data.nutritionDurationWeeks) ? data.nutritionDurationWeeks : prev);
+        setCalories(prev => (data.calories !== undefined && prev !== data.calories) ? data.calories : prev);
+        setIsAutoCalories(prev => (data.isAutoCalories !== undefined && prev !== data.isAutoCalories) ? data.isAutoCalories : prev);
+        setWeightHistory(prev => (data.weightHistory && JSON.stringify(prev) !== JSON.stringify(data.weightHistory)) ? data.weightHistory : prev);
+        setSelectedProgramId(prev => (data.selectedProgramId !== undefined && prev !== data.selectedProgramId) ? data.selectedProgramId : prev);
+        setWeakpointFocus(prev => (data.weakpointFocus !== undefined && prev !== data.weakpointFocus) ? data.weakpointFocus : prev);
+        setDayMapping(prev => (data.dayMapping && JSON.stringify(prev) !== JSON.stringify(data.dayMapping)) ? data.dayMapping : prev);
+        setCustomScheduleStartDate(prev => (data.customScheduleStartDate !== undefined && prev !== data.customScheduleStartDate) ? data.customScheduleStartDate : prev);
+        setBodyFat(prev => (data.bodyFat !== undefined && prev !== data.bodyFat) ? data.bodyFat : prev);
+        setCardioCompleted(prev => (data.cardioCompleted !== undefined && prev !== data.cardioCompleted) ? data.cardioCompleted : prev);
+        setMeasurementHistory(prev => (data.measurementHistory && JSON.stringify(prev) !== JSON.stringify(data.measurementHistory)) ? data.measurementHistory : prev);
+        setMeasurementUnit(prev => (data.measurementUnit === 'in' || data.measurementUnit === 'cm') && prev !== data.measurementUnit ? data.measurementUnit : prev);
+      } else {
+        // First time user - initialize Firestore with local data or defaults
+        const initialData = {
+          uid: user.uid,
+          workout,
+          schedule,
+          archive,
+          exp,
+          programDuration,
+          programStartDate,
+          lastChecked,
+          currentWeight,
+          targetWeight,
+          nutritionGoal,
+          proteinPerKg,
+          nutritionStartDate,
+          nutritionDurationWeeks,
+          calories,
+          isAutoCalories,
+          weightHistory,
+          measurementHistory,
+          measurementUnit,
+          selectedProgramId,
+          weakpointFocus,
+          dayMapping,
+          customScheduleStartDate,
+          bodyFat,
+          cardioCompleted,
+          theme,
+          level: 1,
+          updatedAt: new Date().toISOString()
+        };
+        setDoc(userDocRef, sanitizeFirestoreData(initialData)).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
+      }
+      setIsSyncing(false);
+      setHasInitialSyncCompleted(true);
+      setSyncError(null);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
+      setIsSyncing(false);
+      setHasInitialSyncCompleted(true);
+      setSyncError("Sync failed. Permissions or network error.");
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady, user]);
+
+  const [syncRequestCount, setSyncRequestCount] = useState(0);
+  const prevSyncCount = useRef(0);
+  const triggerCloudSync = useCallback(() => {
+    setSyncRequestCount(c => c + 1);
+  }, []);
+
+  // Local Storage Sync (Immediate on state change)
+  useEffect(() => {
+    localStorage.setItem('sovereign_workout', JSON.stringify(workout));
+    localStorage.setItem('sovereign_schedule', JSON.stringify(schedule));
+    localStorage.setItem('sovereign_archive', JSON.stringify(archive));
+    localStorage.setItem('sovereign_exp', (exp ?? 0).toString());
+    localStorage.setItem('sovereign_program_duration', (programDuration ?? 0).toString());
+    localStorage.setItem('sovereign_program_start_date', programStartDate ?? '');
+    localStorage.setItem('sovereign_current_weight', (currentWeight ?? 0).toString());
+    localStorage.setItem('sovereign_target_weight', (targetWeight ?? 0).toString());
+    localStorage.setItem('sovereign_nutrition_goal', nutritionGoal ?? 'MAINTAIN');
+    localStorage.setItem('sovereign_protein_per_kg', (proteinPerKg ?? 2.0).toString());
+    localStorage.setItem('sovereign_nutrition_start_date', nutritionStartDate ?? '');
+    localStorage.setItem('sovereign_nutrition_duration_weeks', (nutritionDurationWeeks ?? 12).toString());
+    localStorage.setItem('sovereign_calories', (calories ?? 2500).toString());
+    localStorage.setItem('sovereign_auto_calories', (isAutoCalories ?? true).toString());
+    localStorage.setItem('sovereign_body_fat', (bodyFat ?? 15).toString());
+    localStorage.setItem('sovereign_cardio_completed', (cardioCompleted ?? false).toString());
+    localStorage.setItem('sovereign_weight_history', JSON.stringify(weightHistory ?? []));
+    localStorage.setItem('sovereign_measurement_history', JSON.stringify(measurementHistory ?? []));
+    localStorage.setItem('sovereign_measurement_unit', measurementUnit);
+    if (selectedProgramId) localStorage.setItem('sovereign_selected_program_id', selectedProgramId);
+    else localStorage.removeItem('sovereign_selected_program_id');
+    if (weakpointFocus) localStorage.setItem('sovereign_weakpoint_focus', weakpointFocus);
+    else localStorage.removeItem('sovereign_weakpoint_focus');
+    localStorage.setItem('sovereign_day_mapping', JSON.stringify(dayMapping ?? {}));
+    if (customScheduleStartDate) localStorage.setItem('sovereign_custom_schedule_start_date', customScheduleStartDate);
+    if (lastChecked) localStorage.setItem('sovereign_last_checked', lastChecked);
+  }, [workout, schedule, archive, exp, lastChecked, programDuration, programStartDate, currentWeight, targetWeight, nutritionGoal, proteinPerKg, nutritionStartDate, nutritionDurationWeeks, calories, isAutoCalories, weightHistory, measurementHistory, measurementUnit, selectedProgramId, weakpointFocus, dayMapping, customScheduleStartDate, bodyFat, cardioCompleted, theme]);
+
+  // Firestore Sync - Save Data (Triggered only on explicit actions)
+  useEffect(() => {
+    if (!isAuthReady || !user || !hasInitialSyncCompleted) return;
+
+    if (syncRequestCount > prevSyncCount.current) {
+      prevSyncCount.current = syncRequestCount;
+      setIsSyncing(true);
+      
+      const userDocRef = doc(db, 'users', user.uid);
+      const rawPayload = {
+        uid: user.uid,
+        workout,
+        schedule,
+        archive,
+        exp,
+        programDuration,
+        programStartDate,
+        lastChecked,
+        currentWeight,
+        targetWeight,
+        nutritionGoal,
+        proteinPerKg,
+        nutritionStartDate,
+        nutritionDurationWeeks,
+        calories,
+        isAutoCalories,
+        weightHistory,
+        measurementHistory,
+        measurementUnit,
+        selectedProgramId,
+        weakpointFocus,
+        dayMapping,
+        customScheduleStartDate,
+        bodyFat,
+        cardioCompleted,
+        theme,
+        level: Math.floor(exp / 1000) + 1,
+        updatedAt: new Date().toISOString()
+      };
+
+      setDoc(userDocRef, sanitizeFirestoreData(rawPayload), { merge: true }).catch(err => {
+        console.error("Failed to save to Firestore", err);
+        handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
+      }).finally(() => {
+        setIsSyncing(false);
+      });
+    }
+  }, [syncRequestCount, workout, schedule, archive, exp, lastChecked, user, isAuthReady, programDuration, programStartDate, currentWeight, targetWeight, nutritionGoal, proteinPerKg, nutritionStartDate, nutritionDurationWeeks, calories, isAutoCalories, weightHistory, measurementHistory, measurementUnit, selectedProgramId, weakpointFocus, dayMapping, customScheduleStartDate, bodyFat, cardioCompleted, theme, hasInitialSyncCompleted]);
+
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const handleLogin = async () => {
+    setAuthError(null);
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (error: any) {
+      console.error("Login failed", error);
+      let message = "Login failed. Please try again.";
+      if (error.code === 'auth/popup-blocked') {
+        message = "Popup blocked! Please allow popups for this site.";
+      } else if (error.code === 'auth/unauthorized-domain') {
+        message = "Domain not authorized in Firebase Console.";
+      } else if (error.message) {
+        message = error.message;
+      }
+      setAuthError(message);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error("Logout failed", error);
+    }
+  };
+  const [activeTab, setActiveTab] = useState('Daily Quest');
+  const [selectedDay, setSelectedDay] = useState('Day 1');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [newExercise, setNewExercise] = useState({ name: '', target: '', weight: '', reps: 0, sets: '' });
+  const [timer, setTimer] = useState(0);
+  const [isTimerActive, setIsTimerActive] = useState(false);
+  const [timeLeftInDay, setTimeLeftInDay] = useState('');
+  const [scheduleMonth, setScheduleMonth] = useState(new Date());
+  const [selectedScheduleDate, setSelectedScheduleDate] = useState<Date | null>(() => new Date());
+  const [showPurgeModal, setShowPurgeModal] = useState(false);
+  const [isRestDayModalOpen, setIsRestDayModalOpen] = useState(false);
+  const [isWorkoutInitModalOpen, setIsWorkoutInitModalOpen] = useState(false);
+  const [comparisonModal, setComparisonModal] = useState<{ isOpen: boolean; weight: number; label: string } | null>(null);
+
+  const getWeightComparison = (weight: number) => {
+    if (weight <= 0) return "A feather (0 KG)";
+    if (weight < 5) return "A bag of sugar (approx. 1-2 KG)";
+    if (weight < 20) return "A medium-sized dog (approx. 10-15 KG)";
+    if (weight < 50) return "A large suitcase (approx. 23-30 KG)";
+    if (weight < 100) return "A baby elephant (approx. 90 KG)";
+    if (weight < 200) return "A giant panda (approx. 100-150 KG)";
+    if (weight < 500) return "A grand piano (approx. 300-400 KG)";
+    if (weight < 1000) return "A grizzly bear (approx. 600-800 KG)";
+    if (weight < 2000) return "A small car (approx. 1,000-1,500 KG)";
+    if (weight < 5000) return "A large SUV or a hippo (approx. 2,000-3,000 KG)";
+    if (weight < 10000) return "An African elephant (approx. 6,000 KG)";
+    if (weight < 20000) return "A school bus (approx. 12,000 KG)";
+    if (weight < 50000) return "A humpback whale (approx. 30,000 KG)";
+    if (weight < 100000) return "A Space Shuttle (approx. 75,000 KG)";
+    return "A Blue Whale (approx. 150,000+ KG)";
+  };
+  const [isWorkoutActive, setIsWorkoutActive] = useState(false);
+  const [expandedExercises, setExpandedExercises] = useState<string[]>([]);
+  const [expandedScheduleExercises, setExpandedScheduleExercises] = useState<string[]>([]);
+  const [editingArchiveEntry, setEditingArchiveEntry] = useState<ArchiveEntry | null>(null);
+
+  const handleEditArchive = (entry: ArchiveEntry) => {
+    setEditingArchiveEntry(entry);
+  };
+
+  const createManualArchiveEntry = (date: Date) => {
+    const dateStr = format(date, 'yyyy-MM-dd');
+    const dayName = DAYS[date.getDay() === 0 ? 6 : date.getDay() - 1];
+    
+    const newEntry: ArchiveEntry = {
+      id: Math.random().toString(36).substr(2, 9),
+      date: dateStr,
+      day: dayName,
+      type: 'COMPLETED',
+      details: `Manual Entry: ${dayName} Cycle`,
+      exercises: [],
+      progress: 100,
+      duration: 0
+    };
+    
+    setEditingArchiveEntry(newEntry);
+  };
+
+  const saveArchiveEdit = (updatedEntry: ArchiveEntry) => {
+    const exercises = updatedEntry.exercises || [];
+    const completedCount = exercises.filter(ex => ex.completed).length;
+    const computedProgress = exercises.length > 0
+      ? Math.round((completedCount / exercises.length) * 100)
+      : (updatedEntry.type === 'COMPLETED' ? 100 : 0);
+
+    const normalizedEntry: ArchiveEntry = {
+      ...updatedEntry,
+      progress: updatedEntry.type === 'COMPLETED' ? 100 : computedProgress
+    };
+
+    setArchive(prev => {
+      const filtered = prev.filter(e => e.id !== normalizedEntry.id && e.date !== normalizedEntry.date);
+      return [normalizedEntry, ...filtered].sort((a, b) => b.date.localeCompare(a.date));
+    });
+
+    // If editing today's entry, also keep today's active workout and cardio in sync
+    const todayStr = format(new Date(), 'yyyy-MM-dd');
+    if (normalizedEntry.date === todayStr) {
+      if (normalizedEntry.exercises && normalizedEntry.exercises.length > 0) {
+        setWorkout(normalizedEntry.exercises);
+      }
+      if (normalizedEntry.cardioCompleted !== undefined) {
+        setCardioCompleted(Boolean(normalizedEntry.cardioCompleted));
+      }
+    }
+
+    setEditingArchiveEntry(null);
+    triggerCloudSync();
+  };
+
+  const deleteArchiveEntry = (id: string) => {
+    setArchive(prev => prev.filter(e => e.id !== id));
+    setEditingArchiveEntry(null);
+    triggerCloudSync();
+  };
+
+  const handleGoalChange = (goal: 'CUT' | 'BULK' | 'MAINTAIN') => {
+    setNutritionGoal(goal);
+    setNutritionStartDate(format(new Date(), 'yyyy-MM-dd'));
+    let newTarget = currentWeight;
+    if (goal === 'BULK') {
+      newTarget = currentWeight + 5;
+      setProteinPerKg(2.0); // Slightly lower protein needed in surplus
+    } else if (goal === 'CUT') {
+      newTarget = currentWeight - 5;
+      setProteinPerKg(2.4); // Higher protein needed in deficit to preserve muscle
+    } else {
+      setProteinPerKg(2.2); // Maintenance
+    }
+    setTargetWeight(newTarget);
+    
+    if (isAutoCalories) {
+      const tdee = Math.round(currentWeight * 2.2 * 15);
+      if (goal === 'CUT') setCalories(tdee - 500);
+      else if (goal === 'BULK') setCalories(tdee + 300);
+      else setCalories(tdee);
+    }
+    
+    // Update schedule with the new phase
+    setSchedule(prev => {
+      const newSchedule: WeeklySchedule = {};
+      Object.keys(prev).forEach(week => {
+        const weekNum = parseInt(week);
+        newSchedule[weekNum] = prev[weekNum].map(day => ({ ...day, phase: goal }));
+      });
+      return newSchedule;
+    });
+  };
+
+  const logWeight = (weight: number) => {
+    const newEntry: WeightEntry = {
+      id: Math.random().toString(36).substr(2, 9),
+      date: format(new Date(), 'yyyy-MM-dd'),
+      weight
+    };
+    setWeightHistory(prev => [newEntry, ...prev].sort((a, b) => b.date.localeCompare(a.date)));
+    setCurrentWeight(weight);
+    
+    if (isAutoCalories) {
+      const tdee = Math.round(weight * 2.2 * 15);
+      if (nutritionGoal === 'CUT') setCalories(tdee - 500);
+      else if (nutritionGoal === 'BULK') setCalories(tdee + 300);
+      else setCalories(tdee);
+    }
+  };
+
+  const deleteWeightEntry = (id: string) => {
+    setWeightHistory(prev => prev.filter(e => e.id !== id));
+  };
+
+  const proteinRequirement = Math.round(currentWeight * proteinPerKg);
+
+  const getNutritionPhaseStatus = () => {
+    const start = new Date(nutritionStartDate);
+    const durationDays = nutritionDurationWeeks * 7;
+    const end = new Date(start.getTime() + (durationDays * 24 * 60 * 60 * 1000));
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const elapsedDays = Math.floor((today.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
+    const remainingDays = Math.max(0, durationDays - elapsedDays);
+    const progress = Math.min(100, Math.max(0, (elapsedDays / durationDays) * 100));
+    
+    return {
+      startDate: format(start, 'MMM dd, yyyy'),
+      endDate: format(end, 'MMM dd, yyyy'),
+      remainingWeeks: Math.floor(remainingDays / 7),
+      remainingDays: remainingDays % 7,
+      elapsedDays,
+      progress,
+      isCompleted: remainingDays === 0
+    };
+  };
+
+  // Persistence Effects
+  useEffect(() => {
+    localStorage.setItem('sovereign_workout', JSON.stringify(workout));
+  }, [workout]);
+
+  useEffect(() => {
+    localStorage.setItem('sovereign_schedule', JSON.stringify(schedule));
+  }, [schedule]);
+
+  useEffect(() => {
+    localStorage.setItem('sovereign_archive', JSON.stringify(archive));
+  }, [archive]);
+
+  useEffect(() => {
+    localStorage.setItem('sovereign_exp', (exp ?? 0).toString());
+  }, [exp]);
+
+  useEffect(() => {
+    localStorage.setItem('sovereign_current_weight', (currentWeight ?? 0).toString());
+  }, [currentWeight]);
+
+  useEffect(() => {
+    localStorage.setItem('sovereign_target_weight', (targetWeight ?? 0).toString());
+  }, [targetWeight]);
+
+  useEffect(() => {
+    localStorage.setItem('sovereign_nutrition_goal', nutritionGoal ?? 'MAINTAIN');
+  }, [nutritionGoal]);
+
+  useEffect(() => {
+    localStorage.setItem('sovereign_protein_per_kg', (proteinPerKg ?? 2.0).toString());
+  }, [proteinPerKg]);
+
+  useEffect(() => {
+    if (lastChecked) {
+      localStorage.setItem('sovereign_last_checked', lastChecked);
+    }
+  }, [lastChecked]);
+
+  const RANKS = useMemo(() => [
+    { name: 'E', min: 0, max: 1000, title: 'RECRUIT' },
+    { name: 'D', min: 1001, max: 2500, title: 'SOLDIER' },
+    { name: 'C', min: 2501, max: 5000, title: 'OPERATOR' },
+    { name: 'B', min: 5001, max: 8000, title: 'ELITE' },
+    { name: 'A', min: 8001, max: 12000, title: 'COMMANDER' },
+    { name: 'S', min: 12001, max: 18000, title: 'MONARCH' },
+    { name: 'S+', min: 18001, max: 25000, title: 'SHADOW LORD' },
+    { name: 'S++', min: 25001, max: Infinity, title: 'ALPHA WOLF' },
+  ], []);
+
+  const currentRank = useMemo(() => {
+    return RANKS.find(r => exp >= r.min && exp <= r.max) || RANKS[0];
+  }, [exp, RANKS]);
+
+  const nextRank = useMemo(() => {
+    const currentIndex = RANKS.findIndex(r => r.name === currentRank.name);
+    return RANKS[currentIndex + 1] || null;
+  }, [currentRank, RANKS]);
+
+  const rankProgress = useMemo(() => {
+    if (!nextRank) return 100;
+    const range = nextRank.min - currentRank.min;
+    const progress = exp - currentRank.min;
+    return Math.min(Math.max((progress / range) * 100, 0), 100);
+  }, [exp, currentRank, nextRank]);
+
+  useEffect(() => {
+    const updateTimer = () => {
+      const now = new Date();
+      const endOfDay = new Date();
+      endOfDay.setHours(23, 59, 59, 999);
+      
+      const diff = endOfDay.getTime() - now.getTime();
+      const hours = Math.floor(diff / (1000 * 60 * 60));
+      const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+      const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+      
+      setTimeLeftInDay(
+        `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+      );
+    };
+
+    updateTimer();
+    const interval = setInterval(updateTimer, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Persistence Effects
+  // Data is automatically saved to localStorage whenever state changes.
+
+  // Auto-update program schedule when week changes
+  useEffect(() => {
+    if (selectedProgramId && programStartDate) {
+      const currentWeek = getProgramCurrentCycle();
+      const program = PROGRAMS.find(p => p.id === selectedProgramId);
+      if (program) {
+        // Check if we need to update based on current week
+        // We re-apply the program to ensure the schedule matches the current week's data
+        applyProgram(selectedProgramId, weakpointFocus, programStartDate);
+      }
+    }
+  }, [selectedProgramId, programStartDate, weakpointFocus]);
+
+  const syncWorkoutWithSchedule = useCallback(() => {
+    const currentDayName = getProgramCurrentDay();
+    const currentWeekNum = getProgramCurrentCycle();
+    
+    const weekSchedule = schedule[currentWeekNum] || schedule[1] || [];
+    const todaySchedule = weekSchedule.find(s => s.day === currentDayName);
+
+    if (todaySchedule) {
+      if (!selectedProgramId && !isRepeatSchedule) {
+        try {
+          const today = new Date();
+          const start = parseISO(customScheduleStartDate);
+          const diffDays = differenceInDays(today, start);
+          if (diffDays >= 10) {
+            setWorkout([]);
+            return;
+          }
+        } catch (e) {
+          // Fallback
+        }
+      }
+      setWorkout(todaySchedule.exercises.map(ex => ({ ...ex, completed: false })));
+    } else {
+      setWorkout([]);
+    }
+  }, [schedule, selectedProgramId, programStartDate, weakpointFocus, isRepeatSchedule, customScheduleStartDate]);
+
+  // Daily Reset & Violation Check
+  useEffect(() => {
+    const checkViolations = () => {
+      const program = PROGRAMS.find(p => p.id === selectedProgramId);
+      const cycleLen = program ? Object.keys(program.dayLabels || {}).length : 7;
+      
+      const getDayInfo = (date: Date) => {
+        if (!selectedProgramId || !programStartDate) {
+          const idx = date.getDay() === 0 ? 6 : date.getDay() - 1;
+          return { dayName: DAYS[idx] || 'Day 1', weekNum: 1 };
+        }
+        try {
+          const start = parseISO(programStartDate);
+          let diffDays = differenceInDays(date, start);
+          if (diffDays < 0) diffDays = 0;
+          const dayIndex = diffDays % cycleLen;
+          const weekNum = Math.floor(diffDays / cycleLen) + 1;
+          return { dayName: DAYS[dayIndex] || 'Day 1', weekNum };
+        } catch (e) {
+          const idx = date.getDay() === 0 ? 6 : date.getDay() - 1;
+          return { dayName: DAYS[idx] || 'Day 1', weekNum: 1 };
+        }
+      };
+
+      const today = new Date();
+      const todayStr = format(today, 'yyyy-MM-dd');
+      const { dayName: currentDayName } = getDayInfo(today);
+
+      if (lastChecked && lastChecked !== todayStr) {
+        const lastDate = parseISO(lastChecked);
+        let newEntries: ArchiveEntry[] = [];
+        
+        let checkDate = new Date(lastDate);
+        checkDate.setDate(checkDate.getDate() + 1);
+        let iterations = 0;
+
+        while (format(checkDate, 'yyyy-MM-dd') < todayStr && iterations < 31) {
+          const dateStr = format(checkDate, 'yyyy-MM-dd');
+          const { dayName, weekNum } = getDayInfo(checkDate);
+          
+          const hasEntry = archive.some(entry => entry.date === dateStr);
+          
+          const weekSchedule = schedule[weekNum] || schedule[1] || [];
+          const daySchedule = weekSchedule.find(s => s.day === dayName);
+          const isRestDay = !daySchedule || daySchedule.exercises.length === 0;
+          
+          if (!hasEntry && !isRestDay) {
+            const entryId = Math.random().toString(36).substr(2, 9);
+            newEntries.push({
+              id: entryId,
+              date: dateStr,
+              day: dayName,
+              type: 'BREACH',
+              details: `Protocol Breach: Missed ${dayName} Cycle (Auto-Logged)`,
+              cardioCompleted: false
+            });
+          } else if (!hasEntry && isRestDay) {
+            // Log a rest day entry so we don't keep checking it
+            const entryId = Math.random().toString(36).substr(2, 9);
+            newEntries.push({
+              id: entryId,
+              date: dateStr,
+              day: dayName,
+              type: 'COMPLETED',
+              details: `Rest Day: ${dayName} Recovery Protocol`,
+              cardioCompleted: true // Rest days assume cardio is optional or done
+            });
+          }
+          
+          checkDate.setDate(checkDate.getDate() + 1);
+          iterations++;
+        }
+
+        if (newEntries.length > 0) {
+          setArchive(prev => [...newEntries, ...prev]);
+        }
+
+        // Auto-fill Daily Quest
+        syncWorkoutWithSchedule();
+
+        setIsWorkoutActive(false);
+        setLastChecked(todayStr);
+      } else if (!lastChecked) {
+        syncWorkoutWithSchedule();
+        setLastChecked(todayStr);
+      }
+    };
+
+    checkViolations();
+  }, [lastChecked, archive, schedule, syncWorkoutWithSchedule]);
+
+  // Sync today's workout with schedule changes
+  useEffect(() => {
+    if (Object.keys(schedule).length === 0) return;
+    const currentDayName = getProgramCurrentDay();
+    const currentWeekNum = getProgramCurrentCycle();
+    const weekSchedule = schedule[currentWeekNum] || schedule[1] || [];
+    const todaySchedule = weekSchedule.find(s => s.day === currentDayName);
+    
+    if (todaySchedule) {
+      setWorkout(prev => {
+        const scheduleIds = todaySchedule.exercises.map(e => e.id);
+        const workoutIds = prev.map(e => e.id);
+        
+        // Find exercises to remove
+        const toRemove = prev.filter(ex => !scheduleIds.includes(ex.id));
+        
+        // Check if anything actually changed (IDs, order, or properties)
+        const hasIdChanges = toRemove.length > 0 || todaySchedule.exercises.some(ex => !workoutIds.includes(ex.id));
+        const hasPropertyChanges = todaySchedule.exercises.some(schedEx => {
+          const existing = prev.find(p => p.id === schedEx.id);
+          if (!existing) return false;
+          const isSubstituted = Boolean(
+            existing.isSubstituted ||
+            (existing.name !== schedEx.name && (
+              schedEx.substitutions?.includes(existing.name) ||
+              existing.substitutions?.includes(schedEx.name)
+            ))
+          );
+          const nameChangedInSchedule = existing.name !== schedEx.name && !isSubstituted;
+          return (
+            nameChangedInSchedule ||
+            (!isSubstituted && existing.weight !== schedEx.weight) ||
+            (!isSubstituted && existing.reps !== schedEx.reps) ||
+            existing.sets !== schedEx.sets
+          );
+        });
+        const hasOrderChanges = prev.length === todaySchedule.exercises.length && 
+                               prev.some((ex, i) => ex.id !== todaySchedule.exercises[i].id);
+
+        if (!hasIdChanges && !hasPropertyChanges && !hasOrderChanges) return prev;
+
+        // Subtract XP for removed or changed completed exercises
+        const removedCompleted = toRemove.filter(ex => ex.completed);
+        const changedCompleted = todaySchedule.exercises.filter(schedEx => {
+          const existing = prev.find(p => p.id === schedEx.id);
+          if (!existing || !existing.completed) return false;
+          const isSubstituted = Boolean(
+            existing.isSubstituted ||
+            (existing.name !== schedEx.name && (
+              schedEx.substitutions?.includes(existing.name) ||
+              existing.substitutions?.includes(schedEx.name)
+            ))
+          );
+          const nameChangedInSchedule = existing.name !== schedEx.name && !isSubstituted;
+          return (
+            nameChangedInSchedule ||
+            (!isSubstituted && existing.weight !== schedEx.weight) ||
+            (!isSubstituted && existing.reps !== schedEx.reps) ||
+            existing.sets !== schedEx.sets
+          );
+        });
+        
+        const totalRemovedExp = (removedCompleted.length + changedCompleted.length) * 100;
+        if (totalRemovedExp > 0) {
+          setExp(prevExp => Math.max(0, prevExp - totalRemovedExp));
+        }
+
+        // Reconstruct workout based on schedule order and updated properties
+        return todaySchedule.exercises.map(schedEx => {
+          const existingEx = prev.find(p => p.id === schedEx.id);
+          if (existingEx) {
+            const isSubstituted = Boolean(
+              existingEx.isSubstituted ||
+              (existingEx.name !== schedEx.name && (
+                schedEx.substitutions?.includes(existingEx.name) ||
+                existingEx.substitutions?.includes(schedEx.name)
+              ))
+            );
+            const isChanged = (
+              (existingEx.name !== schedEx.name && !isSubstituted) ||
+              (!isSubstituted && existingEx.weight !== schedEx.weight) ||
+              (!isSubstituted && existingEx.reps !== schedEx.reps) ||
+              existingEx.sets !== schedEx.sets
+            );
+
+            const combinedSubstitutions = getExerciseSubstitutions(
+              isSubstituted ? existingEx.name : schedEx.name,
+              [...(schedEx.substitutions || []), ...(existingEx.substitutions || [])]
+            );
+
+            return {
+              ...schedEx,
+              ...existingEx,
+              name: isSubstituted ? existingEx.name : (isChanged ? schedEx.name : existingEx.name),
+              target: isSubstituted ? existingEx.target : (isChanged ? schedEx.target : existingEx.target),
+              videoUrl: isSubstituted ? existingEx.videoUrl : (isChanged ? schedEx.videoUrl : existingEx.videoUrl),
+              notes: isSubstituted ? existingEx.notes : (isChanged ? schedEx.notes : existingEx.notes),
+              substitutions: combinedSubstitutions,
+              isSubstituted: isSubstituted,
+              completed: isChanged ? false : existingEx.completed,
+              weight: isChanged && !isSubstituted ? schedEx.weight : existingEx.weight,
+              reps: isChanged && !isSubstituted ? schedEx.reps : existingEx.reps,
+              sets: isChanged ? schedEx.sets : existingEx.sets,
+              setData: (!isChanged || isSubstituted) && existingEx.setData && existingEx.setData.length === parseInt(existingEx.sets || schedEx.sets)
+                ? existingEx.setData
+                : (isChanged ? undefined : existingEx.setData)
+            };
+          }
+          // New exercise
+          return { ...schedEx, completed: false };
+        });
+      });
+    } else {
+      setWorkout(prev => {
+        if (prev.length === 0) return prev;
+        // Subtract XP for all completed exercises being removed
+        const removedExp = prev.filter(ex => ex.completed).length * 100;
+        if (removedExp > 0) {
+          setExp(prevExp => Math.max(0, prevExp - removedExp));
+        }
+        
+        // Remove today's archive entry if it exists
+        // The archive sync useEffect will handle reverting the bonus/penalty XP
+        const todayStr = format(new Date(), 'yyyy-MM-dd');
+        const todayEntry = archive.find(e => e.date === todayStr);
+        if (todayEntry) {
+          setArchive(prevArchive => prevArchive.filter(e => e.date !== todayStr));
+        }
+        
+        return [];
+      });
+    }
+  }, [schedule]);
+
+  // Keep archive in sync with today's workout state
+  useEffect(() => {
+    const today = new Date();
+    const todayStr = format(today, 'yyyy-MM-dd');
+    const todayEntry = archive.find(e => e.date === todayStr);
+
+    const completedCount = workout.filter(ex => ex.completed).length;
+    const hasAnyCompleted = completedCount > 0;
+    const currentProgress = workout.length > 0 ? Math.round((completedCount / workout.length) * 100) : 100;
+    const isFullyCompleted = workout.length > 0 && completedCount === workout.length;
+    const dayName = getProgramCurrentDay() || DAYS[today.getDay() === 0 ? 6 : today.getDay() - 1];
+
+    if (todayEntry) {
+      // Sync Archive with Workout State
+      const entryIds = todayEntry.exercises?.map(ex => ex.id).sort().join(',') || '';
+      const workoutIds = workout.map(ex => ex.id).sort().join(',');
+      const prevCompletedIds = todayEntry.exercises?.filter(ex => ex.completed).map(ex => ex.id).sort().join(',') || '';
+      const currentCompletedIds = workout.filter(ex => ex.completed).map(ex => ex.id).sort().join(',');
+
+      if (entryIds !== workoutIds || prevCompletedIds !== currentCompletedIds || todayEntry.progress !== currentProgress || todayEntry.cardioCompleted !== cardioCompleted) {
+        setArchive(prev => {
+          const filtered = prev.filter(e => e.date !== todayStr);
+          const updatedEntry: ArchiveEntry = {
+            ...todayEntry,
+            exercises: [...workout],
+            progress: currentProgress,
+            cardioCompleted: cardioCompleted,
+            type: isFullyCompleted ? 'COMPLETED' : (todayEntry.type === 'BREACH' && !hasAnyCompleted ? 'BREACH' : 'INCOMPLETE'),
+            details: isFullyCompleted
+              ? `Protocol Secured: ${todayEntry.day || dayName} Cycle` 
+              : `Protocol In Progress: ${todayEntry.day || dayName} Cycle (${currentProgress}%)`
+          };
+          return [updatedEntry, ...filtered];
+        });
+      }
+    } else if (hasAnyCompleted) {
+      // Automatically record in archive when tasks are completed so schedule reflects it
+      const newEntry: ArchiveEntry = {
+        id: Math.random().toString(36).substr(2, 9),
+        date: todayStr,
+        day: dayName,
+        type: isFullyCompleted ? 'COMPLETED' : 'INCOMPLETE',
+        details: isFullyCompleted
+          ? `Protocol Secured: ${dayName} Cycle` 
+          : `Protocol In Progress: ${dayName} Cycle (${currentProgress}%)`,
+        exercises: [...workout],
+        progress: currentProgress,
+        cardioCompleted: cardioCompleted,
+        duration: timer
+      };
+      setArchive(prev => [newEntry, ...prev.filter(e => e.date !== todayStr)]);
+    }
+  }, [workout, archive, cardioCompleted, timer]);
+
+  const logWorkout = useCallback(() => {
+    const today = new Date();
+    const dateStr = format(today, 'yyyy-MM-dd');
+    const dayName = DAYS[today.getDay() === 0 ? 6 : today.getDay() - 1];
+    
+    const completedCount = workout.filter(item => item.completed).length;
+    const workoutProgress = workout.length > 0 ? (completedCount / workout.length) * 100 : 100;
+    const currentProgress = Math.round((workoutProgress * 0.8) + (cardioCompleted ? 20 : 0));
+
+    const entry: ArchiveEntry = {
+      id: Math.random().toString(36).substr(2, 9),
+      date: dateStr,
+      day: dayName,
+      type: currentProgress === 100 ? 'COMPLETED' : 'INCOMPLETE',
+      details: currentProgress === 100 
+        ? `Protocol Secured: ${dayName} Cycle` 
+        : `Protocol Partial: ${dayName} Cycle (${currentProgress}%)`,
+      exercises: [...workout],
+      progress: currentProgress,
+      duration: timer
+    };
+
+    setArchive(prev => {
+      const filtered = prev.filter(e => e.date !== dateStr);
+      return [entry, ...filtered];
+    });
+
+    setIsTimerActive(false);
+    setIsWorkoutActive(false);
+    triggerCloudSync();
+  }, [workout, timer, cardioCompleted, triggerCloudSync]);
+
+  const completedCount = workout.filter(item => item.completed).length;
+  const workoutProgress = workout.length > 0 ? (workout.filter(ex => ex.completed).length / workout.length) * 100 : 100;
+  const progress = Math.round((workoutProgress * 0.8) + (cardioCompleted ? 20 : 0));
+  const isRestDay = workout.length === 0;
+  
+  // Handle rest day state
+  useEffect(() => {
+    if (isRestDay) {
+      setIsTimerActive(false);
+      setTimer(0);
+    }
+  }, [isRestDay]);
+
+  // Auto-Complete when 100%
+  useEffect(() => {
+    if (progress === 100 && workout.length > 0 && isTimerActive) {
+      setIsTimerActive(false);
+      setIsWorkoutActive(false);
+      const todayStr = format(new Date(), 'yyyy-MM-dd');
+      const alreadyLogged = archive.some(entry => entry.date === todayStr && entry.type === 'COMPLETED');
+      if (!alreadyLogged) {
+        logWorkout();
+      }
+    }
+  }, [progress, workout.length, archive, isTimerActive, logWorkout]);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (isTimerActive && !isRestDay) {
+      interval = setInterval(() => {
+        setTimer(prev => prev + 1);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isTimerActive, isRestDay]);
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const startWorkout = (isReset = false) => {
+    setActiveTab('Daily Quest');
+    if (isRestDay) {
+      setIsRestDayModalOpen(true);
+      setIsWorkoutActive(true);
+      return;
+    }
+    
+    // If re-initializing or reset requested, reset completion status and revert XP/Archive
+    if (isReset || (progress === 100 && workout.length > 0)) {
+      const todayStr = format(new Date(), 'yyyy-MM-dd');
+      
+      // Subtract XP for each exercise that was completed
+      let exerciseExpToSubtract = 0;
+      workout.forEach(ex => {
+        if (ex.completed) {
+          exerciseExpToSubtract += 100;
+        }
+      });
+      
+      if (exerciseExpToSubtract > 0) {
+        setExp(prev => Math.max(0, prev - exerciseExpToSubtract));
+      }
+
+      // Remove all entries for today from archive
+      setArchive(prev => prev.filter(entry => entry.date !== todayStr));
+      setWorkout(prev => prev.map(ex => ({ ...ex, completed: false })));
+    }
+
+    setIsWorkoutActive(true);
+    setIsWorkoutInitModalOpen(true);
+    setIsTimerActive(true);
+    setTimer(0);
+  };
+
+  const toggleExpandedExercise = (id: string) => {
+    setExpandedExercises(prev => 
+      prev.includes(id) ? prev.filter(e => e !== id) : [...prev, id]
+    );
+  };
+
+  const toggleExpandedScheduleExercise = (id: string) => {
+    setExpandedScheduleExercises(prev => 
+      prev.includes(id) ? prev.filter(e => e !== id) : [...prev, id]
+    );
+  };
+
+  const toggleComplete = (id: string) => {
+    if (!isTimerActive) {
+      setIsTimerActive(true);
+    }
+    const item = workout.find(i => i.id === id);
+    if (!item) return;
+
+    const newCompleted = !item.completed;
+    const expChange = newCompleted ? 100 : -100;
+
+    setWorkout(prev => prev.map(i => i.id === id ? { ...i, completed: newCompleted } : i));
+    setExp(prev => Math.max(0, prev + expChange));
+
+    // Keep schedule state synchronized with workout task completions
+    if (Object.keys(schedule).length > 0) {
+      const currentDayName = getProgramCurrentDay();
+      const currentWeekNum = getProgramCurrentCycle();
+
+      setSchedule(prevSchedule => {
+        const weekSchedule = prevSchedule[currentWeekNum] || prevSchedule[1];
+        if (!weekSchedule) return prevSchedule;
+
+        const newWeekSchedule = weekSchedule.map(daySched => {
+          if (daySched.day === currentDayName) {
+            const updatedExercises = daySched.exercises.map(ex => {
+              if (ex.id === id || ex.name.toUpperCase() === item.name.toUpperCase()) {
+                return { ...ex, completed: newCompleted };
+              }
+              return ex;
+            });
+            return { ...daySched, exercises: updatedExercises };
+          }
+          return daySched;
+        });
+
+        const updatedSchedule = { ...prevSchedule, [currentWeekNum]: newWeekSchedule };
+        try {
+          localStorage.setItem('sovereign_schedule', JSON.stringify(updatedSchedule));
+        } catch (e) {
+          console.error("Failed to save schedule to localStorage", e);
+        }
+        return updatedSchedule;
+      });
+    }
+
+    triggerCloudSync();
+  };
+
+  const getScheduleDayDetails = useCallback((date: Date) => {
+    const dateStr = format(date, 'yyyy-MM-dd');
+    const program = PROGRAMS.find(p => p.id === selectedProgramId);
+    const cycleLen = program ? Object.keys(program.dayLabels || {}).length : 7;
+    const diffDays = differenceInDays(date, parseISO(programStartDate));
+    const totalDays = (program?.totalWeeks || 0) * cycleLen;
+    const isInProgram = Boolean(program && diffDays >= 0 && diffDays < totalDays);
+
+    const weekNum = isInProgram ? Math.floor(diffDays / cycleLen) + 1 : 1;
+    const dayIndex = isInProgram
+      ? ((diffDays % cycleLen) + cycleLen) % cycleLen
+      : (date.getDay() === 0 ? 6 : date.getDay() - 1);
+    const dayName = DAYS[dayIndex] || 'Day 1';
+    const mappedDay = dayMapping[dayName] || dayName;
+    const dayLabel = program?.dayLabels?.[mappedDay];
+
+    let weekData = null;
+    if (program) {
+      for (const range in program.weeks || {}) {
+        const [start, end] = range.split('-').map(Number);
+        if (end ? (weekNum >= start && weekNum <= end) : (weekNum === start)) {
+          weekData = program.weeks[range];
+          break;
+        }
+      }
+    }
+
+    const weekSchedule = schedule[weekNum] || [];
+    const schedDay = weekSchedule.find(s => s.day === mappedDay || s.day === dayName);
+    const rawExercises: any[] = (schedDay?.exercises && schedDay.exercises.length > 0)
+      ? schedDay.exercises
+      : (weekData?.days[mappedDay] || []);
+
+    const plannedExercises: WorkoutItem[] = rawExercises.map((ex, idx) => {
+      let updatedEx = { ...ex };
+      if (weakpointFocus && WEAKPOINT_MAPPING[weakpointFocus]) {
+        if (ex.name === 'Weak Point Exercise 1') {
+          updatedEx = { ...updatedEx, ...WEAKPOINT_MAPPING[weakpointFocus].ex1 };
+        } else if (ex.name === 'Weak Point Exercise 2 (optional)') {
+          updatedEx = { ...updatedEx, ...WEAKPOINT_MAPPING[weakpointFocus].ex2 };
+        }
+      }
+      const parsedReps = typeof updatedEx.reps === 'number'
+        ? updatedEx.reps
+        : (parseInt(String(updatedEx.reps || '0')) || 0);
+
+      return {
+        ...updatedEx,
+        id: updatedEx.id || `${dateStr}-ex-${idx}`,
+        reps: parsedReps,
+        weight: updatedEx.weight || '',
+        sets: updatedEx.sets || '1',
+        target: updatedEx.target || '',
+        completed: Boolean(updatedEx.completed)
+      };
+    });
+
+    return {
+      dateStr,
+      program,
+      isInProgram,
+      weekNum,
+      dayName,
+      mappedDay,
+      dayLabel,
+      plannedExercises
+    };
+  }, [selectedProgramId, programStartDate, dayMapping, schedule, weakpointFocus]);
+
+  const toggleScheduleExercise = (exerciseId: string, exName: string, exIdx?: number) => {
+    if (!selectedScheduleDate) return;
+    const isSelectedToday = isSameDay(selectedScheduleDate, new Date());
+
+    if (isSelectedToday) {
+      // Find matching item in today's active workout
+      const targetItem = workout.find((i, idx) =>
+        i.id === exerciseId ||
+        (exIdx !== undefined && idx === exIdx) ||
+        i.name.toUpperCase() === exName.toUpperCase()
+      );
+      if (targetItem) {
+        toggleComplete(targetItem.id);
+        return;
+      }
+    }
+
+    const details = getScheduleDayDetails(selectedScheduleDate);
+    const { dateStr, dayName, plannedExercises } = details;
+    const existingArchive = archive.find(e => e.date === dateStr);
+    const baseExercises: WorkoutItem[] = (existingArchive?.exercises && existingArchive.exercises.length > 0)
+      ? existingArchive.exercises.map((ex, idx) => ({ ...ex, id: ex.id || `${dateStr}-ex-${idx}` }))
+      : plannedExercises.map(ex => ({ ...ex, completed: false }));
+
+    let toggledTo = false;
+    let matched = false;
+    const updatedExercises = baseExercises.map((ex, idx) => {
+      const isMatch = ex.id === exerciseId || (exIdx !== undefined && idx === exIdx) || ex.name.toUpperCase() === exName.toUpperCase();
+      if (!matched && isMatch) {
+        matched = true;
+        toggledTo = !ex.completed;
+        return { ...ex, completed: toggledTo };
+      }
+      return ex;
+    });
+
+    if (!matched) {
+      toggledTo = true;
+      updatedExercises.push({
+        id: exerciseId,
+        name: exName,
+        target: '',
+        weight: '',
+        reps: 0,
+        sets: '1',
+        completed: true
+      });
+    }
+
+    const completedCount = updatedExercises.filter(ex => ex.completed).length;
+    const progress = updatedExercises.length > 0 ? Math.round((completedCount / updatedExercises.length) * 100) : 100;
+    const entryDay = existingArchive?.day || dayName;
+
+    const updatedEntry: ArchiveEntry = {
+      id: existingArchive?.id || Math.random().toString(36).substr(2, 9),
+      date: dateStr,
+      day: entryDay,
+      type: progress === 100 ? 'COMPLETED' : 'INCOMPLETE',
+      details: progress === 100
+        ? `Protocol Secured: ${entryDay} Cycle`
+        : `Protocol In Progress: ${entryDay} Cycle (${progress}%)`,
+      exercises: updatedExercises,
+      progress: progress,
+      cardioCompleted: existingArchive?.cardioCompleted ?? false,
+      duration: existingArchive?.duration ?? 0
+    };
+
+    setExp(prev => Math.max(0, prev + (toggledTo ? 100 : -100)));
+    saveArchiveEdit(updatedEntry);
+  };
+
+  const toggleScheduleCardio = (date: Date) => {
+    if (isSameDay(date, new Date())) {
+      if (!isTimerActive) setIsTimerActive(true);
+      setCardioCompleted(!cardioCompleted);
+      triggerCloudSync();
+      return;
+    }
+
+    const details = getScheduleDayDetails(date);
+    const { dateStr, dayName, plannedExercises } = details;
+    const existingArchive = archive.find(e => e.date === dateStr);
+    const baseExercises: WorkoutItem[] = (existingArchive?.exercises && existingArchive.exercises.length > 0)
+      ? existingArchive.exercises
+      : plannedExercises.map(ex => ({ ...ex, completed: false }));
+
+    const nextCardio = !(existingArchive?.cardioCompleted ?? false);
+    const completedCount = baseExercises.filter(ex => ex.completed).length;
+    const progress = baseExercises.length > 0
+      ? Math.round((completedCount / baseExercises.length) * 100)
+      : (nextCardio ? 100 : 0);
+
+    const updatedEntry: ArchiveEntry = {
+      id: existingArchive?.id || Math.random().toString(36).substr(2, 9),
+      date: dateStr,
+      day: existingArchive?.day || dayName,
+      type: existingArchive?.type || (progress === 100 ? 'COMPLETED' : 'INCOMPLETE'),
+      details: existingArchive?.details || `Protocol Logged: ${dayName} Cycle`,
+      exercises: baseExercises,
+      progress,
+      cardioCompleted: nextCardio,
+      duration: existingArchive?.duration ?? 0
+    };
+
+    saveArchiveEdit(updatedEntry);
+  };
+
+  const markScheduleDayCompleted = (date: Date) => {
+    const isToday = isSameDay(date, new Date());
+    if (isToday) {
+      const newlyCompleted = workout.filter(ex => !ex.completed).length;
+      if (newlyCompleted > 0) {
+        setExp(prev => prev + newlyCompleted * 100);
+      }
+      setWorkout(prev => prev.map(ex => ({ ...ex, completed: true })));
+      setCardioCompleted(true);
+      triggerCloudSync();
+      return;
+    }
+
+    const details = getScheduleDayDetails(date);
+    const { dateStr, dayName, plannedExercises } = details;
+    const existingArchive = archive.find(e => e.date === dateStr);
+    const baseExercises: WorkoutItem[] = (existingArchive?.exercises && existingArchive.exercises.length > 0)
+      ? existingArchive.exercises.map((ex, idx) => ({ ...ex, id: ex.id || `${dateStr}-ex-${idx}` }))
+      : plannedExercises;
+
+    const newlyCompleted = baseExercises.filter(ex => !ex.completed).length;
+    const completedExercises = baseExercises.map(ex => ({ ...ex, completed: true }));
+    const entryDay = existingArchive?.day || dayName;
+
+    const completedEntry: ArchiveEntry = {
+      id: existingArchive?.id || Math.random().toString(36).substr(2, 9),
+      date: dateStr,
+      day: entryDay,
+      type: 'COMPLETED',
+      details: `Protocol Secured: ${entryDay} Cycle`,
+      exercises: completedExercises,
+      progress: 100,
+      cardioCompleted: true,
+      duration: existingArchive?.duration ?? 0
+    };
+
+    if (newlyCompleted > 0) {
+      setExp(prev => prev + newlyCompleted * 100);
+    }
+    saveArchiveEdit(completedEntry);
+  };
+
+  const openScheduleDayEditor = (date: Date) => {
+    const isToday = isSameDay(date, new Date());
+    const details = getScheduleDayDetails(date);
+    const { dateStr, dayName, plannedExercises } = details;
+    const existingArchive = archive.find(e => e.date === dateStr);
+
+    let initialExercises: WorkoutItem[] = [];
+    if (isToday && workout.length > 0) {
+      initialExercises = workout.map(ex => ({ ...ex }));
+    } else if (existingArchive?.exercises && existingArchive.exercises.length > 0) {
+      initialExercises = existingArchive.exercises.map((ex, idx) => ({
+        ...ex,
+        id: ex.id || `${dateStr}-ex-${idx}`
+      }));
+    } else {
+      initialExercises = plannedExercises.map(ex => ({ ...ex, completed: false }));
+    }
+
+    const entryToEdit: ArchiveEntry = existingArchive
+      ? {
+          ...existingArchive,
+          exercises: initialExercises,
+          cardioCompleted: isToday ? cardioCompleted : Boolean(existingArchive.cardioCompleted)
+        }
+      : {
+          id: Math.random().toString(36).substr(2, 9),
+          date: dateStr,
+          day: dayName,
+          type: 'COMPLETED',
+          details: `Protocol Secured: ${dayName} Cycle`,
+          exercises: initialExercises.map(ex => ({ ...ex, completed: true })),
+          progress: 100,
+          cardioCompleted: true,
+          duration: 0
+        };
+
+    setEditingArchiveEntry(entryToEdit);
+  };
+
+  const updateWorkoutItem = (id: string, field: keyof WorkoutItem, value: any) => {
+    setWorkout(prev => prev.map(i => {
+      if (i.id === id) {
+        const updated = { ...i, [field]: value };
+        if (field === 'sets') {
+          const numSets = parseInt(value as string) || 1;
+          const currentSetData = i.setData || [{ weight: i.weight, reps: i.reps }];
+          if (numSets > currentSetData.length) {
+            const lastSet = currentSetData[currentSetData.length - 1] || { weight: i.weight, reps: i.reps };
+            const newSets = Array.from({ length: numSets - currentSetData.length }, () => ({ ...lastSet }));
+            updated.setData = [...currentSetData, ...newSets];
+          } else if (numSets < currentSetData.length) {
+            updated.setData = currentSetData.slice(0, numSets);
+          } else {
+            updated.setData = currentSetData;
+          }
+        }
+        return updated;
+      }
+      return i;
+    }));
+  };
+
+  const updateWorkoutSet = (exerciseId: string, setIndex: number, field: keyof WorkoutSet, value: string | number) => {
+    setWorkout(prev => prev.map(i => {
+      if (i.id === exerciseId) {
+        const currentSetData = i.setData || Array.from({ length: parseInt(i.sets) || 1 }, () => ({ weight: '', reps: i.reps }));
+        const newSetData = [...currentSetData];
+        newSetData[setIndex] = { ...newSetData[setIndex], [field]: value };
+        return { ...i, setData: newSetData };
+      }
+      return i;
+    }));
+  };
+
+  const getExerciseVideoUrl = (exName: string) => {
+    if (!selectedProgramId) return null;
+    const program = PROGRAMS.find(p => p.id === selectedProgramId);
+    if (!program) return null;
+    for (const range in program.weeks) {
+      for (const day in program.weeks[range].days) {
+        const exercise = program.weeks[range].days[day].find(e => e.name === exName);
+        if (exercise && exercise.videoUrl) return exercise.videoUrl;
+      }
+    }
+    return null;
+  };
+
+  const findExerciseTemplate = (exName: string) => {
+    if (!exName) return null;
+    const lowerName = exName.trim().toLowerCase();
+    for (const program of PROGRAMS) {
+      for (const range in program.weeks) {
+        for (const day in program.weeks[range].days) {
+          const exercise = program.weeks[range].days[day].find(e => e.name && e.name.trim().toLowerCase() === lowerName);
+          if (exercise) return exercise;
+        }
+      }
+    }
+    for (const wp in WEAKPOINT_MAPPING) {
+      const option = WEAKPOINT_MAPPING[wp];
+      if (option.ex1.name && option.ex1.name.trim().toLowerCase() === lowerName) return option.ex1;
+      if (option.ex2.name && option.ex2.name.trim().toLowerCase() === lowerName) return option.ex2;
+    }
+    return null;
+  };
+
+  const getExerciseSubstitutions = (exName: string, itemSubstitutions?: string[]): string[] => {
+    if (!exName) return [];
+
+    const adj = new Map<string, Set<string>>();
+
+    const addEdge = (a?: string, b?: string) => {
+      if (!a || !b) return;
+      const cleanA = a.trim();
+      const cleanB = b.trim();
+      if (!cleanA || !cleanB || cleanA.toLowerCase() === cleanB.toLowerCase()) return;
+      if (
+        cleanA.includes('Warm-Up') || cleanB.includes('Warm-Up') ||
+        cleanA.includes('Weak Point') || cleanB.includes('Weak Point') ||
+        cleanA.includes('See The Weak Point') || cleanB.includes('See The Weak Point')
+      ) return;
+
+      if (!adj.has(cleanA)) adj.set(cleanA, new Set());
+      if (!adj.has(cleanB)) adj.set(cleanB, new Set());
+
+      adj.get(cleanA)!.add(cleanB);
+      adj.get(cleanB)!.add(cleanA);
+    };
+
+    // 1. Populate edges from PROGRAMS
+    for (const program of PROGRAMS) {
+      for (const range in program.weeks) {
+        for (const day in program.weeks[range].days) {
+          for (const exercise of program.weeks[range].days[day]) {
+            if (exercise.name && exercise.substitutions) {
+              for (const sub of exercise.substitutions) {
+                addEdge(exercise.name, sub);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Populate edges from WEAKPOINT_MAPPING
+    for (const wp in WEAKPOINT_MAPPING) {
+      const opt = WEAKPOINT_MAPPING[wp];
+      if (opt.ex1.name && opt.ex1.substitutions) {
+        for (const sub of opt.ex1.substitutions) {
+          addEdge(opt.ex1.name, sub);
+        }
+      }
+      if (opt.ex2.name && opt.ex2.substitutions) {
+        for (const sub of opt.ex2.substitutions) {
+          addEdge(opt.ex2.name, sub);
+        }
+      }
+    }
+
+    // 3. Populate extra substitutions passed in
+    if (itemSubstitutions && Array.isArray(itemSubstitutions)) {
+      for (const sub of itemSubstitutions) {
+        addEdge(exName, sub);
+      }
+    }
+
+    // Traverse the graph starting from exName
+    const cleanedExName = exName.trim();
+    const visitedKeys = new Map<string, string>();
+    const queue: string[] = [cleanedExName];
+    if (itemSubstitutions && Array.isArray(itemSubstitutions)) {
+      for (const s of itemSubstitutions) {
+        if (s && typeof s === 'string') queue.push(s.trim());
+      }
+    }
+
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      const currKey = curr.toLowerCase();
+      if (visitedKeys.has(currKey)) continue;
+      visitedKeys.set(currKey, curr);
+
+      for (const [node, neighbors] of adj.entries()) {
+        if (node.toLowerCase() === currKey) {
+          for (const neighbor of neighbors) {
+            if (!visitedKeys.has(neighbor.toLowerCase())) {
+              queue.push(neighbor);
+            }
+          }
+        }
+      }
+    }
+
+    const targetKey = cleanedExName.toLowerCase();
+    const results: string[] = [];
+    for (const [key, original] of visitedKeys.entries()) {
+      if (key !== targetKey) {
+        results.push(original);
+      }
+    }
+
+    return results.sort((a, b) => a.localeCompare(b));
+  };
+
+  const getExerciseVideoUrlByName = (exName: string) => {
+    // 1. Check template
+    const template = findExerciseTemplate(exName);
+    if (template && template.videoUrl) return template.videoUrl;
+
+    // 2. Check program
+    const programUrl = getExerciseVideoUrl(exName);
+    if (programUrl) return programUrl;
+
+    // 3. Search in video_titles.json
+    try {
+      const normalizedExName = exName.trim().toLowerCase();
+      const match = Object.entries(videoTitles).find(([id, name]) => 
+        (name as string).trim().toLowerCase() === normalizedExName
+      );
+      if (match) {
+        return `https://www.youtube.com/watch?v=${match[0]}`;
+      }
+    } catch (e) {
+      console.error("Error looking up video by name in video_titles.json", e);
+    }
+
+    return null;
+  };
+
+  const getPreviousLiftData = (exerciseName: string) => {
+    const history = archive
+      .filter(e => e.exercises && e.exercises.some(ex => ex.name.toUpperCase() === exerciseName.toUpperCase()))
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    if (history.length === 0) return null;
+
+    // Look for the most recent entry where the exercise itself was marked as completed
+    const lastCompletedExerciseEntry = history.find(e => 
+      e.exercises?.some(ex => ex.name.toUpperCase() === exerciseName.toUpperCase() && ex.completed)
+    );
+
+    // Fallback to the absolute most recent entry containing this exercise if none were marked as completed
+    const targetEntry = lastCompletedExerciseEntry || history[0];
+    if (!targetEntry) return null;
+
+    const pastEx = targetEntry.exercises?.find(ex => ex.name.toUpperCase() === exerciseName.toUpperCase());
+    if (!pastEx) return null;
+
+    return {
+      date: targetEntry.date,
+      dayName: targetEntry.day,
+      weight: pastEx.weight,
+      reps: pastEx.reps,
+      sets: pastEx.sets,
+      setData: pastEx.setData,
+      completed: pastEx.completed
+    };
+  };
+
+  const getOverloadSuggestion = (exerciseName: string) => {
+    const history = archive
+      .filter(e => e.exercises)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    if (history.length === 0) return null;
+
+    const lastCompletedEntry = history.find(e => e.type === 'COMPLETED');
+    if (!lastCompletedEntry) return null;
+
+    const pastEx = lastCompletedEntry.exercises?.find(ex => ex.name.toUpperCase() === exerciseName.toUpperCase());
+    if (!pastEx) return null;
+
+    // Check if they've breached this exercise recently
+    const recentBreach = history.slice(0, 3).some(e => 
+      e.type === 'INCOMPLETE' && e.exercises?.some(ex => ex.name.toUpperCase() === exerciseName.toUpperCase() && !ex.completed)
+    );
+
+    if (recentBreach) return null;
+
+    // Simple heuristic: if weight is numeric, suggest +2.5. If not, suggest +2 reps.
+    const numericWeight = parseFloat(pastEx.weight.replace(/[^0-9.]/g, ''));
+    if (!isNaN(numericWeight)) {
+      const unit = pastEx.weight.replace(/[0-9.]/g, '') || 'kg';
+      return {
+        type: 'WEIGHT',
+        suggestion: `${numericWeight + 2.5}${unit}`,
+        original: pastEx.weight
+      };
+    }
+    return {
+      type: 'REPS',
+      suggestion: pastEx.reps + 2,
+      original: pastEx.reps
+    };
+  };
+
+  const getProgramCurrentCycle = () => {
+    if (!programStartDate || !selectedProgramId) return 1;
+    try {
+      const program = PROGRAMS.find(p => p.id === selectedProgramId);
+      const cycleLength = program ? Object.keys(program.dayLabels || {}).length : 7;
+      
+      const start = parseISO(programStartDate);
+      const now = new Date();
+      const diffDays = differenceInDays(now, start);
+      return Math.max(1, Math.floor(diffDays / cycleLength) + 1);
+    } catch (e) {
+      return 1;
+    }
+  };
+
+  const getProgramCurrentDay = () => {
+    if (!programStartDate || !selectedProgramId) return 'Day 1';
+    try {
+      const program = PROGRAMS.find(p => p.id === selectedProgramId);
+      const cycleLength = program ? Object.keys(program.dayLabels || {}).length : 7;
+
+      const start = parseISO(programStartDate);
+      const now = new Date();
+      let diffDays = differenceInDays(now, start);
+      if (diffDays < 0) diffDays = 0;
+      const dayIndex = diffDays % cycleLength;
+      return DAYS[dayIndex] || 'Day 1';
+    } catch (e) {
+      return 'Day 1';
+    }
+  };
+
+  const applyProgram = (programId: string, weakpoint: string | null, startDate: string = programStartDate) => {
+    const program = PROGRAMS.find(p => p.id === programId);
+    if (!program) return;
+
+    // Set basic program state
+    setSelectedProgramId(programId);
+    setWeakpointFocus(weakpoint);
+    setProgramStartDate(startDate);
+    
+    localStorage.setItem('sovereign_selected_program_id', programId);
+    localStorage.setItem('sovereign_program_start_date', startDate);
+    if (weakpoint) localStorage.setItem('sovereign_weakpoint_focus', weakpoint);
+    else localStorage.removeItem('sovereign_weakpoint_focus');
+
+    const newWeeklySchedule: WeeklySchedule = {};
+    
+    // Generate all weeks for the program
+    for (let w = 1; w <= program.totalWeeks; w++) {
+      let weekData = null;
+      for (const range in program.weeks) {
+        const [start, end] = range.split('-').map(Number);
+        if (end) {
+          if (w >= start && w <= end) {
+            weekData = program.weeks[range];
+            break;
+          }
+        } else if (w === start) {
+          weekData = program.weeks[range];
+          break;
+        }
+      }
+      
+      if (!weekData) {
+        const firstRange = Object.keys(program.weeks)[0];
+        weekData = program.weeks[firstRange];
+      }
+
+      newWeeklySchedule[w] = DAYS.map(day => {
+        const mappedDay = dayMapping[day] || day;
+        const baseExercises = weekData.days[mappedDay] || [];
+        
+        const combinedExercises: WorkoutItem[] = baseExercises.map(ex => {
+          let updatedEx = { ...ex };
+          if (weakpoint && WEAKPOINT_MAPPING[weakpoint]) {
+            if (ex.name === 'Weak Point Exercise 1') {
+              updatedEx = { ...updatedEx, ...WEAKPOINT_MAPPING[weakpoint].ex1 };
+            } else if (ex.name === 'Weak Point Exercise 2 (optional)') {
+              updatedEx = { ...updatedEx, ...WEAKPOINT_MAPPING[weakpoint].ex2 };
+            }
+          }
+          const fullSubs = getExerciseSubstitutions(updatedEx.name, updatedEx.substitutions);
+          return {
+            ...updatedEx,
+            substitutions: fullSubs,
+            id: Math.random().toString(36).substr(2, 9),
+            completed: false
+          };
+        });
+
+        return {
+          day,
+          exercises: combinedExercises
+        };
+      });
+    }
+
+    setSchedule(newWeeklySchedule);
+    localStorage.setItem('sovereign_schedule', JSON.stringify(newWeeklySchedule));
+    setCurrentWeekTab(getProgramCurrentCycle());
+    syncWorkoutWithSchedule();
+    triggerCloudSync();
+  };
+
+  const applyCustomSchedule = () => {
+    if (confirm('Are you sure you want to reset your schedule? This will remove the current program.')) {
+      setSelectedProgramId(null);
+      setWeakpointFocus(null);
+      
+      const newSchedule: WeeklySchedule = {};
+      for (let i = 1; i <= programDuration; i++) {
+        newSchedule[i] = JSON.parse(JSON.stringify(INITIAL_SCHEDULE));
+      }
+      
+      setSchedule(newSchedule);
+      localStorage.removeItem('sovereign_selected_program_id');
+      localStorage.removeItem('sovereign_weakpoint_focus');
+      localStorage.setItem('sovereign_schedule', JSON.stringify(newSchedule));
+      setIsProtocolDropdownOpen(false);
+      triggerCloudSync();
+    }
+  };
+
+  const addExerciseToSchedule = () => {
+    if (!newExercise.name) return;
+    
+    const numSets = parseInt(newExercise.sets) || 1;
+    const setData: WorkoutSet[] = Array.from({ length: numSets }, () => ({
+      weight: newExercise.weight,
+      reps: newExercise.reps
+    }));
+
+    const exercise: WorkoutItem = {
+      id: Math.random().toString(36).substr(2, 9),
+      ...newExercise,
+      setData,
+      completed: false
+    };
+
+    setSchedule(prev => {
+      const currentWeekSchedule = prev[currentWeekTab] || INITIAL_SCHEDULE;
+      const updatedWeekSchedule = currentWeekSchedule.map(d => 
+        d.day === selectedDay ? { ...d, exercises: [...d.exercises, exercise] } : d
+      );
+      return {
+        ...prev,
+        [currentWeekTab]: updatedWeekSchedule
+      };
+    });
+    setNewExercise({ name: '', target: '', weight: '', reps: 0, sets: '' });
+  };
+
+  const removeExerciseFromSchedule = (day: string, id: string) => {
+    setSchedule(prev => {
+      const currentWeekSchedule = prev[currentWeekTab] || INITIAL_SCHEDULE;
+      const updatedWeekSchedule = currentWeekSchedule.map(d => 
+        d.day === day ? { ...d, exercises: d.exercises.filter(e => e.id !== id) } : d
+      );
+      return {
+        ...prev,
+        [currentWeekTab]: updatedWeekSchedule
+      };
+    });
+  };
+
+  const clearArchive = () => {
+    setArchive([]);
+    setWorkout([]);
+    
+    const newSchedule: WeeklySchedule = {};
+    for (let i = 1; i <= programDuration; i++) {
+      newSchedule[i] = JSON.parse(JSON.stringify(INITIAL_SCHEDULE));
+    }
+    
+    setSchedule(newSchedule);
+    setMeasurementHistory([]);
+    setExp(0);
+    setLastChecked(null);
+    localStorage.clear();
+    setShowPurgeModal(false);
+  };
+
+  // Update schedule when week changes
+  useEffect(() => {
+    if (selectedProgramId) {
+      const currentWeek = getProgramCurrentCycle();
+      const lastWeek = parseInt(localStorage.getItem('sovereign_last_week') || '0');
+      
+      if (currentWeek !== lastWeek) {
+        applyProgram(selectedProgramId, weakpointFocus, programStartDate);
+        localStorage.setItem('sovereign_last_week', currentWeek.toString());
+      }
+    }
+  }, [selectedProgramId, programStartDate, weakpointFocus]);
+  const calculateStreak = () => {
+    const todayStr = format(new Date(), 'yyyy-MM-dd');
+    const isTodayCompleted = workout.length > 0 && workout.every(e => e.completed);
+
+    const completedDateList = archive
+      .filter(e => e.type === 'COMPLETED')
+      .map(e => e.date);
+
+    if (isTodayCompleted && !completedDateList.includes(todayStr)) {
+      completedDateList.push(todayStr);
+    }
+
+    if (completedDateList.length === 0) return 0;
+    
+    // Get unique dates with COMPLETED status, sorted descending
+    const completedDates = Array.from(new Set<string>(completedDateList)).sort(
+      (a, b) => new Date(b).getTime() - new Date(a).getTime()
+    );
+
+    if (completedDates.length === 0) return 0;
+
+    let streak = 0;
+    let currentDate = new Date();
+    currentDate.setHours(0, 0, 0, 0);
+
+    // Check if the most recent completion is today or yesterday
+    const latestCompletion = new Date(completedDates[0] as string);
+    latestCompletion.setHours(0, 0, 0, 0);
+    
+    const diffDays = Math.floor((currentDate.getTime() - latestCompletion.getTime()) / (1000 * 60 * 60 * 24));
+    
+    if (diffDays > 1) return 0; // Streak broken if more than 1 day since last completion
+
+    for (let i = 0; i < completedDates.length; i++) {
+      if (i === 0) {
+        streak = 1;
+        continue;
+      }
+
+      const prev = new Date(completedDates[i-1] as string);
+      const curr = new Date(completedDates[i] as string);
+      prev.setHours(0, 0, 0, 0);
+      curr.setHours(0, 0, 0, 0);
+
+      const diff = Math.floor((prev.getTime() - curr.getTime()) / (1000 * 60 * 60 * 24));
+      
+      if (diff === 1) {
+        streak++;
+      } else {
+        break;
+      }
+    }
+
+    return streak;
+  };
+
+  const stats = useMemo(() => {
+    const filteredArchive = archive;
+
+    if (filteredArchive.length === 0) {
+      return [
+        { label: 'Protocol Completion', value: '0%', icon: Activity, color: 'text-primary-container' },
+        { label: 'Total Volume', value: '0 KG', icon: Zap, color: 'text-primary-container' },
+        { label: 'Active Streak', value: `${calculateStreak()} DAYS`, icon: Shield, color: 'text-primary-container' },
+        { label: 'Rank Status', value: currentRank.name, icon: Target, color: 'text-primary-container' },
+      ];
+    }
+
+    // Completion Rate
+    const totalProgress = filteredArchive.reduce((acc, entry) => {
+      if (entry.type === 'COMPLETED') return acc + 100;
+      if (entry.type === 'BREACH' || entry.type === 'INCOMPLETE') return acc + (entry.progress || 0);
+      return acc;
+    }, 0);
+    const avgCompletion = Math.round(totalProgress / filteredArchive.length);
+
+    // Total Volume
+    const totalVolume = filteredArchive.reduce((acc, entry) => {
+      if (!entry.exercises) return acc;
+      return acc + entry.exercises.reduce((exAcc, ex) => {
+        if (!ex.completed) return exAcc;
+        const weight = parseFloat(ex.weight.replace(/[^0-9.]/g, '')) || 0;
+        const sets = parseInt(ex.sets) || 0;
+        return exAcc + (weight * ex.reps * sets);
+      }, 0);
+    }, 0);
+
+    // Rank Status from EXP
+    const rankStatus = currentRank.name;
+
+    return [
+      { label: 'Protocol Completion', value: `${avgCompletion}%`, icon: Activity, color: 'text-primary-container' },
+      { label: 'Total Volume', value: `${totalVolume.toLocaleString()} KG`, icon: Zap, color: 'text-primary-container', numericValue: totalVolume },
+      { label: 'Active Streak', value: `${calculateStreak()} DAYS`, icon: Shield, color: 'text-primary-container' },
+      { label: 'Rank Status', value: rankStatus, icon: Target, color: 'text-primary-container' },
+    ];
+  }, [archive, currentRank, workout]);
+
+  return (
+    <div className="min-h-screen bg-background text-on-surface font-body selection:bg-primary-container selection:text-on-primary-container relative overflow-x-hidden">
+      {/* Global HUD Overlays */}
+      <div className="fixed inset-0 pointer-events-none z-50 overflow-hidden">
+        <div className="absolute inset-0  opacity-[0.03]"></div>
+        <div className="absolute top-0 left-0 w-full h-1 bg-primary-container/10 animate-pulse"></div>
+        <div className="absolute bottom-0 left-0 w-full h-1 bg-primary-container/10 animate-pulse"></div>
+      </div>
+
+      {/* Top Navigation */}
+      <nav className="fixed top-0 w-full z-50 border-b border-primary-container/15 bg-background/80 backdrop-blur-xl flex justify-between items-center px-4 md:px-8 py-4">
+        <div className="text-sm md:text-2xl font-bold  text-primary-container glow-text-primary font-sans font-semibold ">
+          THE WOLF PROTOCOL
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="hidden md:flex space-x-8 font-sans font-semibold  text-sm ">
+            {['Daily Quest', 'Schedule', 'Stats', 'Video Library'].map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`transition-all hover:text-primary-container ${activeTab === tab ? 'text-primary-container font-bold' : 'text-on-surface-variant'}`}
+              >
+                {tab}
+              </button>
+            ))}
+          </div>
+          
+          <div className="flex items-center gap-3 border-l border-white/5 pl-4">
+            {authError && (
+              <div className="hidden md:flex items-center gap-2 bg-error/10 border border-error/30 px-3 py-1.5 mr-2">
+                <AlertTriangle className="w-3 h-3 text-error" />
+                <span className="text-xs font-bold text-error  ">{authError}</span>
+                <button onClick={() => setAuthError(null)} className="text-error hover:text-white ml-2">×</button>
+              </div>
+            )}
+            {user ? (
+              <div className="flex items-center gap-3">
+                <div className="hidden md:block text-right">
+                  <div className="text-xs font-bold text-primary-container   leading-none mb-1">Operator</div>
+                  <div className="text-sm font-sans font-semibold text-on-surface  ">{user.displayName || 'OPERATOR_01'}</div>
+                </div>
+                <button 
+                  onClick={handleLogout}
+                  className="w-8 h-8 border border-primary-container/30 flex items-center justify-center bg-primary-container/10 hover:bg-primary-container/20 transition-all group"
+                  title="Logout"
+                >
+                  {user.photoURL ? (
+                    <img src={user.photoURL} alt="User" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  ) : (
+                    <LogOut className="w-4 h-4 text-primary-container group-hover:scale-110 transition-transform" />
+                  )}
+                </button>
+              </div>
+            ) : (
+              <button 
+                onClick={handleLogin}
+                className="flex items-center gap-2 bg-primary-container/10 border border-primary-container/30 px-3 py-1.5 hover:bg-primary-container/20 transition-all"
+              >
+                <LogIn className="w-4 h-4 text-primary-container" />
+                <span className="font-sans font-semibold text-sm font-bold text-primary-container  ">Login</span>
+              </button>
+            )}
+          </div>
+        </div>
+      </nav>
+
+      {/* Main Content */}
+      <>
+          {/* Sidebar Navigation */}
+          <aside className={`hidden md:flex fixed left-0 top-0 h-full w-64 z-40 border-r border-primary-container/10 bg-surface-container-low flex-col py-20 px-4 transition-transform duration-300 ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+            <div className="mb-12 px-4">
+              <div className="text-primary-container font-bold font-sans font-semibold text-sm  ">RANK: {currentRank.name}</div>
+              <div className="text-on-surface-variant font-sans font-semibold text-xs ">{currentRank.title} ACTIVE</div>
+            </div>
+            
+            <div className="space-y-2 flex-grow">
+              {[
+                { name: 'Daily Quest', icon: Bolt },
+                { name: 'Schedule', icon: CalendarIcon },
+                { name: 'Stats', icon: BarChart3 },
+                { name: 'Video Library', icon: Play },
+              ].map((item) => (
+                <button
+                  key={item.name}
+                  onClick={() => setActiveTab(item.name)}
+                  className={`w-full flex items-center space-x-3 p-3 font-sans font-semibold text-sm font-bold   transition-all hover:translate-x-1 ${
+                    activeTab === item.name
+                      ? 'text-primary-container bg-surface-container-low border-l-4 border-primary-container' 
+                      : 'text-on-surface-variant/50 hover:text-on-surface hover:bg-surface-container-high'
+                  }`}
+                >
+                  <item.icon className="w-4 h-4" />
+                  <span>{item.name}</span>
+                </button>
+              ))}
+            </div>
+
+            <button 
+              onClick={startWorkout}
+              className="mt-8 bg-primary-container text-on-primary-container py-4 font-sans font-semibold text-sm font-bold   hover:brightness-125 transition-all active:scale-95"
+            >
+              INITIALIZE WORKOUT
+            </button>
+
+            <div className="mt-auto px-4 pt-8 border-t border-white/5">
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  {isSyncing ? (
+                    <RefreshCw className="w-3 h-3 text-primary-container animate-spin" />
+                  ) : user ? (
+                    <Cloud className="w-3 h-3 text-primary-container" />
+                  ) : (
+                    <CloudOff className="w-3 h-3 text-on-surface-variant/30" />
+                  )}
+                  <span className="font-label text-[7px] text-on-surface-variant  ">
+                    {isSyncing ? 'Syncing...' : user ? 'Cloud Active' : 'Offline Mode'}
+                  </span>
+                </div>
+                {syncError && (
+                  <div className="flex items-center gap-1 text-error">
+                    <AlertTriangle className="w-2 h-2" />
+                    <span className="text-[6px] ">{syncError}</span>
+                  </div>
+                )}
+              </div>
+              {/* Support and Logs removed per user request */}
+            </div>
+          </aside>
+
+          {/* Main Content */}
+          <main className="md:ml-64 pt-20 md:pt-24 pb-32 md:pb-12 px-4 md:px-8">
+        <div className="max-w-6xl mx-auto space-y-4 md:space-y-12">
+          {activeTab === 'Daily Quest' && (
+            <div className="space-y-6">
+              {isRestDay ? (
+                <div className="flex flex-col items-center justify-center py-20 border border-dashed border-emerald-500/20 bg-surface-container-low/20 rounded-3xl">
+                  <Shield className="w-16 h-16 text-emerald-500/20 mb-4" />
+                  <h3 className="font-sans font-semibold text-lg font-bold text-emerald-400">Rest Day Active</h3>
+                  <p className="text-sm text-on-surface-variant/60 mt-2">No objectives assigned for this cycle.</p>
+                  <button 
+                    onClick={() => setActiveTab('Schedule')}
+                    className="mt-6 text-emerald-400 font-sans font-semibold text-sm font-bold hover:underline"
+                  >
+                    Modify Schedule
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-8">
+                  {/* Daily Objectives Info Box */}
+                  <div className="bg-primary-container/5 border border-primary-container/20 p-6 relative overflow-hidden group flame-purple mb-6">
+                    <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:scale-110 transition-transform duration-500">
+                      <Activity className="w-16 h-16 text-primary-container" />
+                    </div>
+                    <div className="relative z-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+                      
+                      <div className="flex flex-col">
+                        <div className="font-label text-xs text-primary-container tracking-[0.3em] mb-1">Daily Quest</div>
+                        <h3 className="font-sans font-semibold text-2xl font-bold text-on-surface flex items-center gap-3">
+                          <Bolt className="w-6 h-6 text-primary-container" />
+                          Today's Workout
+                        </h3>
+                        {selectedProgramId && PROGRAMS.find(p => p.id === selectedProgramId)?.dayLabels?.[getProgramCurrentDay()] && (
+                          <div className="mt-1 font-label text-sm text-on-surface-variant opacity-70">
+                            {PROGRAMS.find(p => p.id === selectedProgramId)?.dayLabels?.[getProgramCurrentDay()]}
+                          </div>
+                        )}
+                      </div>
+                      
+                      <div className="flex items-center gap-4">
+                        <div className="flex flex-col items-end text-right">
+                          <div className={`font-sans font-semibold text-sm ${cardioCompleted ? 'text-primary-container line-through' : 'text-on-surface'}`}>
+                            Treadmill Protocol
+                          </div>
+                          <div className="font-label text-[10px] text-on-surface-variant tracking-[0.1em]">
+                            30-45 Min LISS / HIIT
+                          </div>
+                        </div>
+                        
+                        <button 
+                          onClick={(e) => { 
+                            e.stopPropagation(); 
+                            if (!isTimerActive) setIsTimerActive(true);
+                            setCardioCompleted(!cardioCompleted); 
+                            triggerCloudSync();
+                          }}
+                          className={`rounded-xl border px-4 py-2 font-sans font-semibold text-xs font-bold transition-all ${
+                            cardioCompleted 
+                              ? 'bg-primary-container/20 text-primary-container border-primary-container/50' 
+                              : 'bg-surface-container-high text-on-surface border-white/5 hover:bg-primary-container/10'
+                          }`}
+                        >
+                          {cardioCompleted ? 'Completed' : 'Mark Done'}
+                        </button>
+                      </div>
+
+                    </div>
+                  </div>
+
+                        {workout.length > 0 && (
+                          <div className="w-full bg-surface-container-high h-2 rounded-full overflow-hidden">
+                            <div 
+                              className="h-full bg-primary-container transition-all duration-500 ease-out"
+                              style={{ width: `${(workout.filter(item => item.completed).length / workout.length) * 100}%` }}
+                            />
+                          </div>
+                        )}
+
+                      <div className="space-y-3 md:space-y-4">
+                        <AnimatePresence>
+                          {workout.map((item) => (
+                            <div 
+                              key={item.id}
+                              className={`group flex flex-col rounded-2xl mb-3 border transition-colors ${
+                                item.completed 
+                                  ? 'bg-surface-container-low/50 opacity-60 border-primary-container/30' 
+                                  : 'bg-surface-container-low border-white/5 hover:border-primary-container/30'
+                              }`}
+                            >
+                              {/* Header / Summary (Always visible) */}
+                              <div 
+                                className="p-3 md:p-4 flex items-center justify-between cursor-pointer"
+                                onClick={() => toggleExpandedExercise(item.id)}
+                              >
+                                <div className="flex items-center gap-3">
+                                  <ExerciseVisual name={item.name} target={item.target} onVideoClick={setActiveVideoUrl} />
+                                  <div className="flex flex-col gap-1">
+                                    <div className={`font-sans font-semibold font-bold text-sm md:text-base flex items-center gap-2 ${item.completed ? 'line-through text-on-surface-variant' : 'text-on-surface'}`}>
+                                      {item.name}
+                                      {!item.completed && getOverloadSuggestion(item.name) && (
+                                        <TrendingUp className="w-3 h-3 text-primary-container animate-pulse" />
+                                      )}
+                                    </div>
+                                    <div className="font-label text-xs text-on-surface-variant tracking-[0.1em]">
+                                      {item.target} | {item.sets} Sets
+                                    </div>
+                                  </div>
+                                </div>
+                                
+                                <div className="flex items-center gap-3">
+                                  <button 
+                                    onClick={(e) => { e.stopPropagation(); toggleComplete(item.id); }}
+                                    className={`flex items-center justify-center w-8 h-8 md:w-10 md:h-10 rounded-xl transition-all ${
+                                      item.completed 
+                                        ? 'bg-primary-container text-on-primary-container shadow-[0_0_15px_rgba(0,229,255,0.4)]' 
+                                        : 'border border-primary-container/30 bg-primary-container/5 hover:bg-primary-container/20'
+                                    }`}
+                                  >
+                                    {item.completed ? <CheckCircle2 className="w-4 h-4 md:w-5 md:h-5" /> : <Check className="w-4 h-4 md:w-5 md:h-5 text-primary-container" />}
+                                  </button>
+                                  <ChevronDown className={`w-4 h-4 text-on-surface-variant transition-transform ${expandedExercises.includes(item.id) ? 'rotate-180' : ''}`} />
+                                </div>
+                              </div>
+
+                              {/* Expanded Content */}
+                              <AnimatePresence>
+                                {expandedExercises.includes(item.id) && (
+                                  <motion.div
+                                    initial={{ height: 0, opacity: 0 }}
+                                    animate={{ height: 'auto', opacity: 1 }}
+                                    exit={{ height: 0, opacity: 0 }}
+                                    className="overflow-hidden"
+                                  >
+                                    <div className="p-3 md:p-4 pt-0 border-t border-white/5 mt-2">
+                                      {/* Action row: Video */}
+                                      {(item.videoUrl || getExerciseVideoUrl(item.name)) && (
+                                        <button 
+                                          onClick={() => setActiveVideoUrl((item.videoUrl || getExerciseVideoUrl(item.name))!)}
+                                          className="text-error/80 hover:text-error hover:underline text-xs flex items-center gap-1 mb-3 transition-colors font-sans mt-2"
+                                        >
+                                          <Youtube className="w-3 h-3" /> Watch Tutorial
+                                        </button>
+                                      )}
+
+                                      {/* Overload Suggestion */}
+                                      {!item.completed && getOverloadSuggestion(item.name) && (
+                                        <div className="bg-primary-container/10 border border-primary-container/20 p-3 rounded-xl mb-3">
+                                          <div className="text-xs text-primary-container font-bold mb-1 flex items-center gap-1">
+                                            <Zap className="w-3 h-3" /> Progressive Overload Intel
+                                          </div>
+                                          <div className="text-xs text-on-surface">
+                                            Target: <span className="text-primary-container font-bold">{getOverloadSuggestion(item.name)?.suggestion}</span>
+                                            <span className="text-on-surface-variant ml-2">(Prev: {getOverloadSuggestion(item.name)?.original})</span>
+                                          </div>
+                                        </div>
+                                      )}
+
+                                                                             {/* Notes */}
+                                       {item.notes && !item.completed && (
+                                         <div className="mb-3 p-3 bg-primary-container/10 border border-primary-container/20 rounded-xl text-xs text-on-surface leading-relaxed">
+                                           <span className="text-primary-container font-bold mr-1">NOTES:</span> {item.notes}
+                                         </div>
+                                       )}
+
+                                       {/* Previous Lift History */}
+                                       {(() => {
+                                         const prevLift = getPreviousLiftData(item.name);
+                                         if (!prevLift) return null;
+                                         let formattedDate = prevLift.dayName;
+                                         if (prevLift.date) {
+                                           try {
+                                             formattedDate = format(new Date(prevLift.date), 'MMM d, yyyy');
+                                           } catch (e) {
+                                             // fallback
+                                           }
+                                         }
+                                         return (
+                                           <div className="bg-surface-container-high/40 border border-white/5 p-4 rounded-xl mb-4 text-xs">
+                                             <div className="text-on-surface-variant font-bold mb-2 flex items-center justify-between">
+                                               <span className="flex items-center gap-1.5 font-label tracking-wide text-primary-container">
+                                                 <History className="w-3.5 h-3.5" /> Previous Session Intel
+                                               </span>
+                                               <span className="font-mono text-[10px] text-on-surface-variant/70">
+                                                 {formattedDate}
+                                               </span>
+                                             </div>
+                                             
+                                             <div className="grid grid-cols-1 gap-2.5 mt-2">
+                                               <div className="flex justify-between items-center bg-surface-container-low/40 px-3 py-2 rounded-lg border border-white/5">
+                                                 <span className="font-label text-[10px] text-on-surface-variant/60 tracking-wider">OVERALL BEST</span>
+                                                 <span className="font-mono text-on-surface font-semibold text-right">
+                                                   {prevLift.weight || item.weight} × {prevLift.reps || item.reps} ({prevLift.sets || 1} sets)
+                                                 </span>
+                                               </div>
+                                               
+                                               {prevLift.setData && prevLift.setData.length > 0 && (
+                                                 <div className="bg-surface-container-low/40 p-3 rounded-lg border border-white/5 flex flex-col gap-1.5">
+                                                   <span className="block text-[10px] font-label text-on-surface-variant/60 tracking-wider mb-1">SET-BY-SET TRACKED</span>
+                                                   <div className="flex flex-wrap gap-2">
+                                                     {prevLift.setData.map((set, sIdx) => (
+                                                       <span key={sIdx} className="font-mono text-[11px] px-2 py-1 rounded bg-background/55 border border-white/5 text-primary-container">
+                                                         Set {sIdx + 1}: <strong className="text-on-surface">{set.weight || prevLift.weight || item.weight}</strong> × {set.reps || prevLift.reps || item.reps}
+                                                       </span>
+                                                     ))}
+                                                   </div>
+                                                 </div>
+                                               )}
+                                             </div>
+                                           </div>
+                                         );
+                                       })()}
+
+                                       {/* Sets Inputs */}
+                                       <div className="flex flex-col gap-2 mb-3">
+                                        {(item.setData || Array.from({ length: parseInt(item.sets) || 1 }, () => ({ weight: '', reps: item.reps }))).map((set, idx) => (
+                                          <div key={idx} className="flex items-center gap-3 bg-surface-container-high/50 p-3 rounded-xl">
+                                            <span className="font-mono text-xs text-on-surface-variant w-6">#{idx + 1}</span>
+                                            <div className="flex flex-col flex-1">
+                                              {idx === 0 && <span className="font-label text-[10px] text-on-surface-variant mb-1">Weight</span>}
+                                              <input 
+                                                type="text"
+                                                value={set.weight}
+                                                onChange={(e) => updateWorkoutSet(item.id, idx, 'weight', e.target.value)}
+                                                onFocus={(e) => e.target.select()}
+                                                placeholder={item.weight}
+                                                className="w-full bg-transparent border-b border-primary-container/20 font-mono text-primary-container text-base md:text-sm focus:outline-none focus:border-primary-container transition-colors"
+                                              />
+                                            </div>
+                                            <div className="flex flex-col flex-1">
+                                              {idx === 0 && <span className="font-label text-[10px] text-on-surface-variant mb-1">Reps</span>}
+                                              <input 
+                                                type="number"
+                                                value={set.reps}
+                                                onChange={(e) => updateWorkoutSet(item.id, idx, 'reps', parseInt(e.target.value) || 0)}
+                                                onFocus={(e) => e.target.select()}
+                                                placeholder={item.reps.toString()}
+                                                className="w-full bg-transparent border-b border-primary-container/20 font-mono text-primary-container text-base md:text-sm focus:outline-none focus:border-primary-container transition-colors"
+                                              />
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+
+                                      {/* Sets count update */}
+                                      <div className="flex items-center gap-2 mb-3">
+                                        <span className="font-label text-xs text-on-surface-variant">Total Sets:</span>
+                                        <input 
+                                          type="text"
+                                          value={item.sets}
+                                          onChange={(e) => updateWorkoutItem(item.id, 'sets', e.target.value)}
+                                          className="w-12 bg-surface-container-high/30 border-b border-primary-container/20 font-mono text-on-surface-variant text-base md:text-xs text-center focus:outline-none focus:border-primary-container transition-colors"
+                                        />
+                                      </div>
+
+                                      {/* Substitutions */}
+                                      {(() => {
+                                        const availableSubs = getExerciseSubstitutions(item.name, item.substitutions);
+                                        if (availableSubs.length === 0 || item.completed) return null;
+                                        return (
+                                          <div className="flex flex-wrap gap-2">
+                                            <div className="text-[10px] text-on-surface-variant w-full mb-1">Substitutions:</div>
+                                            {availableSubs.map((sub, idx) => (
+                                              <button
+                                                key={idx}
+                                                onClick={() => {
+                                                  const template = findExerciseTemplate(sub);
+                                                  const videoUrl = getExerciseVideoUrlByName(sub) || undefined;
+                                                  const newSubstitutions = getExerciseSubstitutions(sub, [item.name, ...(item.substitutions || []), ...availableSubs]);
+
+                                                  // 1. Update active workout state
+                                                  const updatedWorkout = workout.map(ex => {
+                                                    if (ex.id === item.id) {
+                                                      return {
+                                                        ...ex,
+                                                        name: sub,
+                                                        target: template?.target || ex.target,
+                                                        videoUrl: videoUrl,
+                                                        notes: template?.notes || ex.notes,
+                                                        substitutions: newSubstitutions,
+                                                        isSubstituted: true
+                                                      };
+                                                    }
+                                                    return ex;
+                                                  });
+                                                  setWorkout(updatedWorkout);
+
+                                                  // 2. Persist substitution in schedule state & localStorage so it never resets
+                                                  if (Object.keys(schedule).length > 0) {
+                                                    const currentDayName = getProgramCurrentDay();
+                                                    const currentWeekNum = getProgramCurrentCycle();
+
+                                                    setSchedule(prevSchedule => {
+                                                      const weekSchedule = prevSchedule[currentWeekNum] || prevSchedule[1];
+                                                      if (!weekSchedule) return prevSchedule;
+
+                                                      const newWeekSchedule = weekSchedule.map(daySched => {
+                                                        if (daySched.day === currentDayName) {
+                                                          const updatedExercises = daySched.exercises.map(ex => {
+                                                            if (ex.id === item.id) {
+                                                              return {
+                                                                ...ex,
+                                                                name: sub,
+                                                                target: template?.target || ex.target,
+                                                                videoUrl: videoUrl,
+                                                                notes: template?.notes || ex.notes,
+                                                                substitutions: newSubstitutions,
+                                                                isSubstituted: true
+                                                              };
+                                                            }
+                                                            return ex;
+                                                          });
+                                                          return { ...daySched, exercises: updatedExercises };
+                                                        }
+                                                        return daySched;
+                                                      });
+
+                                                      const updatedSchedule = { ...prevSchedule, [currentWeekNum]: newWeekSchedule };
+                                                      try {
+                                                        localStorage.setItem('sovereign_schedule', JSON.stringify(updatedSchedule));
+                                                      } catch (e) {
+                                                        console.error("Failed to save schedule to localStorage", e);
+                                                      }
+                                                      return updatedSchedule;
+                                                    });
+                                                  }
+
+                                                  triggerCloudSync();
+                                                }}
+                                                className="text-[10px] bg-surface-container-high/50 hover:bg-primary-container/20 text-on-surface-variant hover:text-primary-container px-3 py-1.5 rounded-lg border border-white/10 transition-all"
+                                              >
+                                                Swap: {sub}
+                                              </button>
+                                            ))}
+                                          </div>
+                                        );
+                                      })()}
+                                    </div>
+                                  </motion.div>
+                                )}
+                              </AnimatePresence>
+                            </div>
+                          ))}
+                        </AnimatePresence>
+                      </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'Schedule' && (
+            <motion.div 
+              initial={{ opacity: 0.85 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.1, ease: 'easeOut' }}
+              className="max-w-6xl mx-auto space-y-8"
+            >
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-end border-b border-white/5 pb-6 gap-6">
+                <div>
+                  <span className="font-label text-primary-container text-sm tracking-[0.4em] ">Protocol Planning</span>
+                  <h1 className="font-sans font-semibold text-3xl md:text-5xl font-bold text-on-surface   mt-2">Training Schedule</h1>
+                </div>
+                <div className="relative">
+                  <button 
+                    onClick={() => setIsProtocolDropdownOpen(!isProtocolDropdownOpen)}
+                    className="bg-primary-container/10 text-primary-container border border-primary-container/30 px-6 py-3 font-sans font-semibold text-sm font-bold   hover:bg-primary-container/20 transition-all flex items-center gap-2"
+                  >
+                    <Rocket className="w-4 h-4" />
+                    {selectedProgramId ? PROGRAMS.find(p => p.id === selectedProgramId)?.name : 'Select Program'}
+                    <ChevronDown className={`w-4 h-4 transition-transform ${isProtocolDropdownOpen ? 'rotate-180' : ''}`} />
+                  </button>
+                  
+                  <AnimatePresence>
+                    {isProtocolDropdownOpen && (
+                      <motion.div 
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 10 }}
+                        className="absolute top-full right-0 mt-2 w-64 bg-surface-container-high border border-outline-variant shadow-2xl z-50 overflow-hidden"
+                      >
+                        {PROGRAMS.map(program => (
+                          <button 
+                            key={program.id}
+                            onClick={() => {
+                              setIsProgramModalOpen(true);
+                              setIsProtocolDropdownOpen(false);
+                            }}
+                            className="w-full text-left px-4 py-3 font-sans font-semibold text-sm font-bold   hover:bg-primary-container/10 transition-all border-b border-outline-variant/50 flex justify-between items-center"
+                          >
+                            {program.name}
+                            <ChevronRight className="w-3 h-3" />
+                          </button>
+                        ))}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              </div>
+
+              {selectedProgramId ? (
+                <div className="space-y-8">
+                  {/* Active Program Info */}
+                  <div className="bg-primary-container/5 border border-primary-container/20 p-6 relative overflow-hidden group flame-purple">
+                    <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:scale-110 transition-transform duration-500">
+                      <Rocket className="w-16 h-16 text-primary-container" />
+                    </div>
+                    <div className="relative z-10 flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+                      <div>
+                        <div className="font-label text-xs text-primary-container  tracking-[0.3em] mb-1">Active Program</div>
+                        <h3 className="font-sans font-semibold text-2xl font-bold text-on-surface  ">
+                          {PROGRAMS.find(p => p.id === selectedProgramId)?.name}
+                        </h3>
+                        <p className="text-sm text-on-surface-variant   mt-1 opacity-70">
+                          Current Week: {getProgramCurrentCycle()} / {PROGRAMS.find(p => p.id === selectedProgramId)?.totalWeeks}
+                          <span className="ml-4">Remaining: {PROGRAMS.find(p => p.id === selectedProgramId)?.totalWeeks! - getProgramCurrentCycle() + 1} Weeks</span>
+                          {weakpointFocus && <span className="ml-4 text-primary-container">Weakpoint: {weakpointFocus}</span>}
+                        </p>
+                      </div>
+                      <div className="flex gap-3">
+                        {PROGRAMS.find(p => p.id === selectedProgramId)?.weakpointOptions && (
+                          <button 
+                            onClick={() => setIsWeakpointModalOpen(true)}
+                            className="bg-surface-container-high rounded-2xlest text-on-surface border border-white/5 px-4 py-2 font-sans font-semibold text-xs font-bold   hover:bg-primary-container/10 transition-all"
+                          >
+                            Adjust Weakpoint
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Calendar View */}
+                  <div className="flex flex-col gap-4">
+                    {/* Calendar Grid */}
+                    <div className="bg-surface-container-low p-4 md:p-6 border border-white/5">
+                      <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 md:mb-8 gap-3 md:gap-4">
+                        <h3 className="font-sans font-semibold text-sm md:text-lg font-bold text-primary-container flex items-center gap-2 md:gap-3">
+                          <CalendarIcon className="w-4 h-4 md:w-5 md:h-5" />
+                          Protocol Roadmap
+                        </h3>
+                        <div className="flex flex-wrap gap-2 md:gap-4 items-center w-full md:w-auto justify-between">
+                          <div className="font-label text-xs md:text-sm text-on-surface-variant">
+                            {format(scheduleMonth, 'MMMM yyyy')}
+                          </div>
+                          <div className="flex gap-1 md:gap-2">
+                            <button 
+                              onClick={() => setScheduleMonth(subMonths(scheduleMonth, 1))}
+                              className="p-1.5 md:p-2 bg-surface-container-high hover:bg-surface-container-highest text-on-surface-variant border border-white/5"
+                            >
+                              <ChevronLeft className="w-3 h-3 md:w-4 md:h-4" />
+                            </button>
+                            <button 
+                              onClick={() => setScheduleMonth(addMonths(scheduleMonth, 1))}
+                              className="p-1.5 md:p-2 bg-surface-container-high hover:bg-surface-container-highest text-on-surface-variant border border-white/5"
+                            >
+                              <ChevronRight className="w-3 h-3 md:w-4 md:h-4" />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-7 gap-px bg-outline-variant/10 border border-white/5">
+                        {['S', 'M', 'T', 'W', 'T', 'F', 'S'].map((d, idx) => (
+                          <div key={idx} className="bg-surface-container-low rounded-2xl p-1 md:p-2 text-center font-label text-xs text-on-surface-variant border-b border-white/5">
+                            {d}
+                          </div>
+                        ))}
+                        {(() => {
+                          const monthStart = startOfMonth(scheduleMonth);
+                          const monthEnd = endOfMonth(monthStart);
+                          const startDate = startOfWeek(monthStart);
+                          const endDate = endOfWeek(monthEnd);
+                          const calendarDays = eachDayOfInterval({ start: startDate, end: endDate });
+
+                          return calendarDays.map((day, i) => {
+                            const isSelected = selectedScheduleDate && isSameDay(day, selectedScheduleDate);
+                            const isCurrentMonth = isSameMonth(day, monthStart);
+                            
+                            const diffDays = differenceInDays(day, parseISO(programStartDate));
+                            const program = PROGRAMS.find(p => p.id === selectedProgramId);
+                            const cycleLen = program ? Object.keys(program.dayLabels || {}).length : 7;
+                            const totalDays = (program?.totalWeeks || 0) * cycleLen;
+                            const isInProgram = diffDays >= 0 && diffDays < totalDays;
+                            
+                            let weekNum = 0;
+                            let dayName = '';
+                            let isRestDay = false;
+                            let exercises: any[] = [];
+                            
+                            if (isInProgram) {
+                              const cycleLength = program ? Object.keys(program.dayLabels || {}).length : 7;
+                              weekNum = Math.floor(diffDays / cycleLength) + 1;
+                              const dayIndex = diffDays % cycleLength;
+                              dayName = DAYS[dayIndex] || 'Day 1';
+                              
+                              let weekData = null;
+                              for (const range in program?.weeks || {}) {
+                                const [start, end] = range.split('-').map(Number);
+                                if (end ? (weekNum >= start && weekNum <= end) : (weekNum === start)) {
+                                  weekData = program?.weeks[range];
+                                  break;
+                                }
+                              }
+                              const mappedDay = dayMapping[dayName] || dayName;
+                              exercises = weekData?.days[mappedDay] || [];
+                              isRestDay = exercises.length === 0;
+                            }
+
+                            const dateStr = format(day, 'yyyy-MM-dd');
+                            const dayEntries = archive.filter(e => e.date === dateStr);
+                            const hasCompletedWorkout = dayEntries.some(e => e.type === 'COMPLETED');
+                            const hasPartialArchiveWorkout = dayEntries.some(e => e.type === 'INCOMPLETE' && (e.progress ?? 0) > 0);
+                            const hasIncompleteWorkout = dayEntries.some(e => e.type === 'INCOMPLETE' || e.type === 'BREACH');
+                            const isPastDay = day < new Date(new Date().setHours(0, 0, 0, 0));
+                            const isToday = isSameDay(day, new Date());
+                            const todayCompletedCount = workout.filter(e => e.completed).length;
+                            const isTodayFullyCompleted = workout.length > 0 && todayCompletedCount === workout.length;
+                            const isTodayPartiallyCompleted = todayCompletedCount > 0 && !isTodayFullyCompleted;
+                            
+                            let dotColorClass = "bg-neutral-500/40 shadow-none"; // default (not happened yet / grey)
+                            if (hasCompletedWorkout || (isToday && isTodayFullyCompleted)) {
+                              dotColorClass = "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.7)]";
+                            } else if ((isToday && isTodayPartiallyCompleted) || (!isToday && hasPartialArchiveWorkout)) {
+                              dotColorClass = "bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.7)]";
+                            } else if (hasIncompleteWorkout || isPastDay) {
+                              dotColorClass = "bg-error shadow-[0_0_5px_rgba(255,68,68,0.5)]";
+                            }
+
+                            return (
+                              <button
+                                key={i}
+                                onClick={() => setSelectedScheduleDate(isSelected ? null : day)}
+                                className={`relative h-14 md:h-24 p-1 md:p-2 transition-all hover:z-10 ${
+                                  isCurrentMonth ? 'bg-surface-container-low' : 'bg-surface-container-low/30 opacity-30'
+                                } ${isSelected ? 'ring-2 ring-primary-container ring-inset z-10' : ''} border-r border-b border-white/5 overflow-hidden flex flex-col items-center`}
+                              >
+                                <div className="flex justify-between items-start w-full">
+                                  <span className={`font-mono text-xs md:text-sm ${isToday ? 'text-primary-container font-bold' : 'text-on-surface-variant'}`}>
+                                    {format(day, 'd')}
+                                  </span>
+                                  {isInProgram && isCurrentMonth && (
+                                    <span className={`text-[6px] text-primary-container font-bold`}>
+                                      W{weekNum}
+                                    </span>
+                                  )}
+                                </div>
+                                
+                                {isInProgram && isCurrentMonth && (
+                                  <div className="mt-1 md:mt-2 flex flex-col items-center justify-center w-full">
+                                    {isRestDay ? (
+                                      <CloudOff className="w-3 h-3 md:w-5 md:h-5 text-on-surface-variant/30" />
+                                    ) : (
+                                      <div className={`w-1.5 h-1.5 md:w-2 md:h-2 rounded-full ${dotColorClass}`} />
+                                    )}
+                                  </div>
+                                )}
+                              </button>
+                            );
+                          });
+                        })()}
+                      </div>
+                    </div>
+
+                    {/* Details Panel (Dropdown-like) */}
+                    <AnimatePresence>
+                      {selectedScheduleDate && (
+                        <motion.div 
+                          initial={{ opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: 'auto' }}
+                          exit={{ opacity: 0, height: 0 }}
+                          className="overflow-hidden"
+                        >
+                          <div className="bg-surface-container-low p-6 border border-white/5 border-t-primary-container/30">
+                            <div className="flex flex-wrap justify-between items-center gap-3 mb-4">
+                              <h3 className="font-sans font-semibold text-lg font-bold text-primary-container">
+                                {format(selectedScheduleDate, 'EEEE, MMMM d')}
+                              </h3>
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => openScheduleDayEditor(selectedScheduleDate)}
+                                  className="px-3 py-1.5 rounded-lg text-xs font-bold border border-primary-container/30 bg-primary-container/10 text-primary-container hover:bg-primary-container/20 transition-all flex items-center gap-1.5"
+                                >
+                                  <Edit2 className="w-3.5 h-3.5" />
+                                  Edit Day
+                                </button>
+                                <button onClick={() => setSelectedScheduleDate(null)} className="text-on-surface-variant hover:text-on-surface ml-1">
+                                  <XCircle className="w-5 h-5" />
+                                </button>
+                              </div>
+                            </div>
+                            {(() => {
+                              const details = getScheduleDayDetails(selectedScheduleDate);
+                              const { dateStr, isInProgram, weekNum, dayName, dayLabel, plannedExercises } = details;
+                              const isSelectedToday = isSameDay(selectedScheduleDate, new Date());
+                              const loggedEntries = archive.filter(e => e.date === dateStr);
+                              const loggedExercises = loggedEntries.flatMap(e => e.exercises || []);
+                              const isLogged = loggedExercises.length > 0;
+                              const hasArchiveEntry = loggedEntries.length > 0;
+                              const isArchivedCompleted = loggedEntries.some(e => e.type === 'COMPLETED');
+                              const isArchivedBreach = loggedEntries.some(e => e.type === 'BREACH');
+
+                              if (!isInProgram && !hasArchiveEntry) {
+                                return (
+                                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 py-4">
+                                    <div className="text-on-surface-variant/50 text-sm">
+                                      No active program scheduled for this date.
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => openScheduleDayEditor(selectedScheduleDate)}
+                                      className="px-4 py-2 rounded-lg text-xs font-bold border border-primary-container/30 bg-primary-container/10 text-primary-container hover:bg-primary-container/20 transition-all flex items-center gap-1.5 w-fit"
+                                    >
+                                      <Plus className="w-3.5 h-3.5" />
+                                      Log Workout for Date
+                                    </button>
+                                  </div>
+                                );
+                              }
+
+                              const displayExercises = (isSelectedToday && workout.length > 0)
+                                ? workout
+                                : (isLogged ? loggedExercises : plannedExercises);
+                              
+                              const isRestDay = displayExercises.length === 0 && !isLogged;
+                              const completedTasksCount = displayExercises.filter((ex: any) => ex.completed).length;
+                              const totalTasksCount = displayExercises.length;
+                              const allTasksCompleted = (totalTasksCount > 0 && completedTasksCount === totalTasksCount) || (totalTasksCount === 0 && isArchivedCompleted);
+                              const hasSomeTasksCompleted = completedTasksCount > 0 && !allTasksCompleted;
+                              const selectedCardioCompleted = isSelectedToday
+                                ? cardioCompleted
+                                : Boolean(loggedEntries[0]?.cardioCompleted);
+
+                              return (
+                                <div className="space-y-4">
+                                  <div className="flex flex-wrap justify-between items-center gap-2 border-b border-white/5 pb-3">
+                                    <div className="font-label text-xs text-on-surface-variant flex flex-wrap items-center gap-2">
+                                      <span>{isInProgram ? `Week ${weekNum} • ${dayName}` : 'Custom Entry'}</span>
+                                      {allTasksCompleted ? (
+                                        <span className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded text-[10px] font-bold flex items-center gap-1">
+                                          <CheckCircle2 className="w-3 h-3" /> COMPLETED {totalTasksCount > 0 ? `(${completedTasksCount}/${totalTasksCount})` : ''}
+                                        </span>
+                                      ) : hasSomeTasksCompleted ? (
+                                        <span className="bg-amber-500/20 text-amber-400 border border-amber-500/30 px-2 py-0.5 rounded text-[10px] font-bold flex items-center gap-1">
+                                          IN PROGRESS ({completedTasksCount}/{totalTasksCount})
+                                        </span>
+                                      ) : isArchivedBreach ? (
+                                        <span className="bg-error/20 text-error border border-error/30 px-2 py-0.5 rounded text-[10px] font-bold">
+                                          MISSED
+                                        </span>
+                                      ) : isLogged ? (
+                                        <span className="bg-primary-container/20 text-primary-container px-2 py-0.5 rounded text-[10px] font-bold">
+                                          LOGGED
+                                        </span>
+                                      ) : !isRestDay ? (
+                                        <span className="bg-surface-container-highest text-on-surface-variant px-2 py-0.5 rounded text-[10px] font-bold">
+                                          PLANNED
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      {dayLabel && (
+                                        <div className="font-label text-[10px] text-primary-container/80 font-bold border border-primary-container/20 px-1.5 py-0.5">
+                                          {dayLabel}
+                                        </div>
+                                      )}
+                                      {!isRestDay && !allTasksCompleted && (
+                                        <button
+                                          type="button"
+                                          onClick={() => markScheduleDayCompleted(selectedScheduleDate)}
+                                          className="px-3 py-1 rounded-lg text-[11px] font-bold bg-emerald-500 text-black hover:brightness-110 transition-all flex items-center gap-1 shadow-[0_0_10px_rgba(16,185,129,0.3)]"
+                                        >
+                                          <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                                          Submit Completed
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {!isRestDay && (
+                                    <div className="flex items-center justify-between p-3.5 rounded-xl bg-surface-container-high/60 border border-white/5">
+                                      <div className="flex items-center gap-3">
+                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${selectedCardioCompleted ? 'bg-emerald-500/20 text-emerald-400' : 'bg-primary-container/10 text-primary-container'}`}>
+                                          <Activity className="w-4 h-4" />
+                                        </div>
+                                        <div>
+                                          <div className={`font-sans font-semibold text-xs md:text-sm font-bold ${selectedCardioCompleted ? 'line-through text-on-surface-variant' : 'text-on-surface'}`}>
+                                            Treadmill Protocol (30-45 Min)
+                                          </div>
+                                          <div className="font-label text-[10px] text-on-surface-variant">LISS / HIIT Conditioning</div>
+                                        </div>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={() => toggleScheduleCardio(selectedScheduleDate)}
+                                        className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                                          selectedCardioCompleted 
+                                            ? 'bg-emerald-500 text-black border-emerald-400 font-bold shadow-[0_0_8px_rgba(16,185,129,0.4)]' 
+                                            : 'bg-primary-container/10 text-primary-container border-primary-container/30 hover:bg-primary-container/20'
+                                        }`}
+                                      >
+                                        {selectedCardioCompleted ? 'Completed' : 'Mark Done'}
+                                      </button>
+                                    </div>
+                                  )}
+                                  
+                                  {isRestDay ? (
+                                    <div className="flex flex-col items-center justify-center py-8 text-on-surface-variant/30">
+                                      <CloudOff className="w-8 h-8 mb-2" />
+                                      <span className="text-xs font-bold tracking-widest">REST DAY</span>
+                                    </div>
+                                  ) : (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                                      {displayExercises.map((ex: any, exIdx: number) => {
+                                        const isExCompleted = Boolean(ex.completed);
+                                        return (
+                                          <div 
+                                            key={ex.id || exIdx} 
+                                            className={`bg-surface-container-high rounded-xl p-3 border transition-all ${
+                                              isExCompleted 
+                                                ? 'border-emerald-500/40 bg-emerald-950/20 shadow-[0_0_12px_rgba(16,185,129,0.1)]' 
+                                                : 'border-white/5 hover:border-white/20'
+                                            }`}
+                                          >
+                                            <div className="font-sans font-semibold text-sm text-on-surface flex justify-between items-center gap-2">
+                                              <span className={`transition-colors ${isExCompleted ? 'line-through text-on-surface-variant font-medium' : 'text-on-surface font-semibold'}`}>
+                                                {ex.name}
+                                              </span>
+                                              <button
+                                                type="button"
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  toggleScheduleExercise(ex.id || `${dateStr}-ex-${exIdx}`, ex.name, exIdx);
+                                                }}
+                                                className={`flex items-center justify-center w-7 h-7 rounded-lg transition-all shrink-0 ${
+                                                  isExCompleted
+                                                    ? 'bg-emerald-500 text-black shadow-[0_0_8px_rgba(16,185,129,0.5)]'
+                                                    : 'border border-primary-container/30 bg-primary-container/5 hover:bg-primary-container/20 text-primary-container'
+                                                }`}
+                                                title={isExCompleted ? "Mark Incomplete" : "Mark Completed"}
+                                              >
+                                                {isExCompleted ? <CheckCircle2 className="w-4 h-4 text-black stroke-[2.5]" /> : <Check className="w-4 h-4 text-primary-container" />}
+                                              </button>
+                                            </div>
+                                            <div className="flex justify-between items-center mt-2 mb-2">
+                                              <span className="font-label text-[10px] text-on-surface-variant">{ex.target || 'N/A'}</span>
+                                              <div className="flex items-center gap-2">
+                                                {isExCompleted && (
+                                                  <span className="text-[9px] text-emerald-400 font-bold bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20">
+                                                    COMPLETED
+                                                  </span>
+                                                )}
+                                                <span className="font-mono text-xs text-primary-container">
+                                                  {ex.sets} Sets
+                                                </span>
+                                              </div>
+                                            </div>
+                                            
+                                            {ex.setData ? (
+                                              <div className="grid grid-cols-1 gap-2 pt-2 border-t border-outline-variant/5">
+                                                {ex.setData.map((s: any, idx: number) => (
+                                                  <div key={idx} className="flex items-center justify-between p-2 bg-surface-container-highest/20 border border-white/5 rounded">
+                                                    <div className="flex items-center gap-2">
+                                                      <div className="w-5 h-5 rounded-full bg-primary-container/10 border border-primary-container/20 flex items-center justify-center">
+                                                        <span className="font-sans font-semibold text-xs font-bold text-primary-container">{idx + 1}</span>
+                                                      </div>
+                                                      <span className="font-label text-xs text-on-surface-variant">Set</span>
+                                                    </div>
+                                                    <div className="flex gap-3">
+                                                      <div className="text-right">
+                                                        <div className="text-[6px] text-on-surface-variant/50 leading-none mb-0.5">Weight</div>
+                                                        <div className="font-mono text-sm text-on-surface leading-none">{s.weight}</div>
+                                                      </div>
+                                                      <div className="text-right">
+                                                        <div className="text-[6px] text-on-surface-variant/50 leading-none mb-0.5">Reps</div>
+                                                        <div className="font-mono text-sm text-on-surface leading-none">{s.reps}</div>
+                                                      </div>
+                                                    </div>
+                                                  </div>
+                                                ))}
+                                              </div>
+                                            ) : (
+                                              <div className="flex justify-between items-center p-2 bg-surface-container-highest/20 border border-white/5 rounded pt-2 mt-2">
+                                                <div className="flex items-center gap-2">
+                                                  <div className="w-5 h-5 rounded-full bg-primary-container/10 border border-primary-container/20 flex items-center justify-center">
+                                                    <span className="font-sans font-semibold text-xs font-bold text-primary-container">1</span>
+                                                  </div>
+                                                  <span className="font-label text-xs text-on-surface-variant">Standard Protocol</span>
+                                                </div>
+                                                <div className="flex gap-3">
+                                                  <div className="text-right">
+                                                    <div className="text-[6px] text-on-surface-variant/50 leading-none mb-0.5">Weight</div>
+                                                    <div className="font-mono text-sm text-on-surface leading-none">{ex.weight || '-'}</div>
+                                                  </div>
+                                                  <div className="text-right">
+                                                    <div className="text-[6px] text-on-surface-variant/50 leading-none mb-0.5">Reps</div>
+                                                    <div className="font-mono text-sm text-on-surface leading-none">{ex.reps || '-'}</div>
+                                                  </div>
+                                                </div>
+                                              </div>
+                                            )}
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center py-24 text-on-surface-variant/30 border border-dashed border-white/5">
+                  <CalendarIcon className="w-16 h-16 mb-4 opacity-50" />
+                  <div className="font-sans font-semibold text-lg">No Program Selected</div>
+                  <div className="text-sm mt-2">Select a protocol from the dropdown to view the schedule.</div>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {activeTab === 'Stats' && (
+            <StatsView
+              measurementHistory={measurementHistory}
+              measurementUnit={measurementUnit}
+              onChangeUnit={(nextUnit) => {
+                setMeasurementUnit(nextUnit);
+                triggerCloudSync();
+              }}
+              onSaveEntry={(entry) => {
+                setMeasurementHistory((prev) => {
+                  const filtered = prev.filter(
+                    (e) => e.id !== entry.id && e.date !== entry.date
+                  );
+                  return [entry, ...filtered].sort((a, b) =>
+                    b.date.localeCompare(a.date)
+                  );
+                });
+                triggerCloudSync();
+              }}
+              onDeleteEntry={(id) => {
+                setMeasurementHistory((prev) => prev.filter((e) => e.id !== id));
+                triggerCloudSync();
+              }}
+            />
+          )}
+
+          {activeTab === 'Video Library' && (
+            <motion.div
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-6"
+            >
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                  <span className="font-label text-primary-container text-xs tracking-[0.35em]">
+                    Exercise Demonstrations
+                  </span>
+                  <h2 className="font-sans font-semibold text-2xl font-bold text-on-surface mt-1">
+                    Video Library
+                  </h2>
+                </div>
+                <div className="w-full md:w-72">
+                  <input
+                    type="text"
+                    value={videoSearch}
+                    onChange={(e) => setVideoSearch(e.target.value)}
+                    placeholder="Search exercises..."
+                    className="w-full bg-surface-container-low border border-white/10 rounded-xl px-4 py-2.5 text-sm text-on-surface placeholder:text-on-surface-variant/50 focus:border-primary-container outline-none min-h-[44px]"
+                  />
+                </div>
+              </div>
+
+              {(() => {
+                const query = videoSearch.trim().toLowerCase();
+                const filteredIds = videoIds.filter((id) => {
+                  const title = ((videoTitles as Record<string, string>)[id] || '').toLowerCase();
+                  return !query || title.includes(query);
+                });
+
+                if (filteredIds.length === 0) {
+                  return (
+                    <div className="bg-surface-container-low border border-white/5 rounded-2xl p-12 text-center">
+                      <Youtube className="w-10 h-10 text-on-surface-variant/40 mx-auto mb-3" />
+                      <div className="text-sm font-semibold text-on-surface">
+                        No matching videos found
+                      </div>
+                      <p className="text-xs text-on-surface-variant mt-1">
+                        Try searching a different exercise name.
+                      </p>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {filteredIds.map((id) => {
+                      const title = (videoTitles as Record<string, string>)[id] || 'Exercise Tutorial';
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => setActiveVideoUrl(`https://www.youtube.com/watch?v=${id}`)}
+                          className="group bg-surface-container-low border border-white/5 hover:border-primary-container/50 rounded-2xl overflow-hidden text-left transition-all"
+                        >
+                          <div className="relative aspect-video bg-surface-container-high overflow-hidden">
+                            <img
+                              src={`https://img.youtube.com/vi/${id}/hqdefault.jpg`}
+                              alt={title}
+                              referrerPolicy="no-referrer"
+                              loading="lazy"
+                              className="w-full h-full object-cover opacity-85 group-hover:opacity-100 group-hover:scale-105 transition-all duration-300"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-black/70 via-black/15 to-transparent flex items-center justify-center">
+                              <div className="w-11 h-11 rounded-full bg-primary-container/90 text-on-primary-container flex items-center justify-center shadow-[0_0_20px_rgba(0,229,255,0.4)] group-hover:scale-110 transition-transform">
+                                <Play className="w-5 h-5 fill-current ml-0.5" />
+                              </div>
+                            </div>
+                          </div>
+                          <div className="p-4">
+                            <div className="font-sans font-semibold text-sm text-on-surface group-hover:text-primary-container transition-colors line-clamp-2">
+                              {title}
+                            </div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+            </motion.div>
+          )}
+        </div>
+      </main>
+
+      {/* Purge Confirmation Modal */}
+      <AnimatePresence>
+        {showPurgeModal && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowPurgeModal(false)}
+              className="absolute inset-0 bg-background/95 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-md bg-surface-container-low border border-error/30 p-8 shadow-[0_0_50px_rgba(255,82,82,0.15)]"
+            >
+              <div className="flex items-center gap-4 text-error mb-6">
+                <AlertTriangle className="w-8 h-8" />
+                <h3 className="font-sans font-semibold text-2xl font-bold  ">CRITICAL PURGE</h3>
+              </div>
+              
+              <p className="text-on-surface-variant text-sm leading-relaxed mb-8  tracking-wide">
+                THIS ACTION WILL PERMANENTLY ERASE ALL ARCHIVED DATA, CURRENT PROGRESS, AND TRAINING SCHEDULES. THIS IS A FACTORY RESET OF THE WOLF PROTOCOL.
+              </p>
+
+              <div className="space-y-3">
+                <button 
+                  onClick={clearArchive}
+                  className="w-full bg-error text-on-error py-4 font-sans font-semibold text-sm font-bold tracking-[0.3em]  hover:brightness-110 transition-all"
+                >
+                  CONFIRM FACTORY RESET
+                </button>
+                <button 
+                  onClick={() => setShowPurgeModal(false)}
+                  className="w-full bg-surface-container-high text-on-surface py-4 font-sans font-semibold text-sm font-bold tracking-[0.3em]  hover:bg-surface-container-highest transition-all"
+                >
+                  ABORT SEQUENCE
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Rest Day Alert Modal */}
+      <AnimatePresence>
+        {isRestDayModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsRestDayModalOpen(false)}
+              className="absolute inset-0 bg-background/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-sm bg-surface-container-low border border-emerald-500/30 p-8 shadow-[0_0_50px_rgba(16,185,129,0.1)]"
+            >
+              <div className="flex items-center gap-4 text-emerald-400 mb-6">
+                <Shield className="w-8 h-8" />
+                <h3 className="font-sans font-semibold text-2xl font-bold  ">RECOVERY ACTIVE</h3>
+              </div>
+              
+              <p className="text-on-surface-variant text-sm leading-relaxed mb-8  tracking-wide">
+                CURRENTLY REST DAY ACTIVE. SYSTEM IS IN STANDBY MODE. NO OBJECTIVES ASSIGNED FOR THIS CYCLE.
+              </p>
+
+              <button 
+                onClick={() => setIsRestDayModalOpen(false)}
+                className="w-full bg-emerald-500 text-on-emerald py-4 font-sans font-semibold text-sm font-bold tracking-[0.3em]  hover:brightness-110 transition-all"
+              >
+                ACKNOWLEDGE
+              </button>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Workout Initialized Modal */}
+      <AnimatePresence>
+        {isWorkoutInitModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsWorkoutInitModalOpen(false)}
+              className="absolute inset-0 bg-background/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-sm bg-surface-container-low border border-primary-container/30 p-8 shadow-[0_0_50px_rgba(0,229,255,0.2)]"
+            >
+              <div className="flex items-center gap-4 text-primary-container mb-6">
+                <Rocket className="w-8 h-8" />
+                <h3 className="font-sans font-semibold text-2xl font-bold  ">PROTOCOL ENGAGED</h3>
+              </div>
+              
+              <p className="text-on-surface-variant text-sm leading-relaxed mb-8  tracking-wide">
+                DAILY QUEST INITIALIZED. ALL OBJECTIVES ARE NOW UNLOCKED. SYSTEM IS TRACKING PERFORMANCE.
+              </p>
+
+              <button 
+                onClick={() => setIsWorkoutInitModalOpen(false)}
+                className="w-full bg-primary-container text-on-primary-container py-4 font-sans font-semibold text-sm font-bold tracking-[0.3em]  hover:brightness-110 transition-all"
+              >
+                BEGIN MISSION
+              </button>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Volume Comparison Modal */}
+      <AnimatePresence>
+        {comparisonModal?.isOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setComparisonModal(null)}
+              className="absolute inset-0 bg-background/90 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-md bg-surface-container-low border border-primary-container/30 p-8 shadow-[0_0_50px_rgba(0,229,255,0.15)] overflow-hidden"
+            >
+              {/* Background Decoration */}
+              <div className="absolute -right-12 -top-12 opacity-5">
+                <Zap className="w-48 h-48 text-primary-container" />
+              </div>
+
+              <div className="relative z-10">
+                <div className="flex items-center gap-4 text-primary-container mb-6">
+                  <Activity className="w-8 h-8" />
+                  <h3 className="font-sans font-semibold text-2xl font-bold  ">Volume Comparison</h3>
+                </div>
+                
+                <div className="space-y-6">
+                  <div>
+                    <div className="font-label text-sm text-on-surface-variant   mb-1">{comparisonModal.label}</div>
+                    <div className="font-sans font-semibold text-4xl font-bold text-primary-container">{comparisonModal.weight.toLocaleString()} KG</div>
+                  </div>
+
+                  <div className="bg-primary-container/5 border border-primary-container/20 p-6 relative">
+                    <div className="absolute top-0 left-0 w-1 h-full bg-primary-container"></div>
+                    <div className="font-label text-xs text-primary-container  tracking-[0.3em] mb-3">Equivalent Mass</div>
+                    <div className="font-sans font-semibold text-xl font-bold text-on-surface   leading-tight italic">
+                      "You've lifted the equivalent of {getWeightComparison(comparisonModal.weight)}."
+                    </div>
+                  </div>
+
+                  <p className="text-on-surface-variant text-sm   leading-relaxed">
+                    This represents the total gravitational force overcome during your training cycle. Your physical output is reaching critical levels.
+                  </p>
+
+                  <button 
+                    onClick={() => setComparisonModal(null)}
+                    className="w-full bg-primary-container text-on-primary-container py-4 font-sans font-semibold text-sm font-bold tracking-[0.3em]  hover:brightness-110 transition-all mt-4"
+                  >
+                    Acknowledge Intel
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Archive Edit Modal */}
+      <AnimatePresence>
+        {editingArchiveEntry && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setEditingArchiveEntry(null)}
+              className="absolute inset-0 bg-background/90 backdrop-blur-md"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-2xl bg-surface-container-low border border-primary-container/30 p-6 md:p-8 shadow-[0_0_50px_rgba(0,229,255,0.15)] max-h-[90vh] overflow-y-auto"
+            >
+              <div className="flex justify-between items-center mb-6">
+                <div className="flex items-center gap-4 text-primary-container">
+                  <History className="w-8 h-8" />
+                  <h3 className="font-sans font-semibold text-2xl font-bold  ">Edit Protocol Data</h3>
+                </div>
+                <button 
+                  onClick={() => setEditingArchiveEntry(null)}
+                  className="text-on-surface-variant hover:text-on-surface transition-colors"
+                >
+                  <XCircle className="w-6 h-6" />
+                </button>
+              </div>
+
+              <div className="space-y-6">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="md:col-span-1">
+                    <label className="font-label text-xs text-on-surface-variant   block mb-2">Protocol Details</label>
+                    <input 
+                      type="text" 
+                      value={editingArchiveEntry.details}
+                      onChange={(e) => setEditingArchiveEntry({...editingArchiveEntry, details: e.target.value})}
+                      className="w-full bg-surface-container-high border border-white/5 p-3 font-sans font-semibold text-base md:text-xs   text-on-surface focus:border-primary-container outline-none transition-all"
+                    />
+                  </div>
+                  <div>
+                    <label className="font-label text-xs text-on-surface-variant   block mb-2">Duration (sec)</label>
+                    <input 
+                      type="number" 
+                      value={editingArchiveEntry.duration || 0}
+                      onChange={(e) => setEditingArchiveEntry({...editingArchiveEntry, duration: parseInt(e.target.value) || 0})}
+                      className="w-full bg-surface-container-high border border-white/5 p-3 font-sans font-semibold text-base md:text-xs   text-on-surface focus:border-primary-container outline-none transition-all"
+                    />
+                  </div>
+                  <div>
+                    <label className="font-label text-xs text-on-surface-variant   block mb-2">Status</label>
+                    <select 
+                      value={editingArchiveEntry.type}
+                      onChange={(e) => {
+                        const nextType = e.target.value as 'COMPLETED' | 'INCOMPLETE' | 'BREACH';
+                        const updatedExercises = nextType === 'COMPLETED' && editingArchiveEntry.exercises
+                          ? editingArchiveEntry.exercises.map(ex => ({ ...ex, completed: true }))
+                          : editingArchiveEntry.exercises;
+                        setEditingArchiveEntry({
+                          ...editingArchiveEntry,
+                          type: nextType,
+                          exercises: updatedExercises,
+                          cardioCompleted: nextType === 'COMPLETED' ? true : editingArchiveEntry.cardioCompleted
+                        });
+                      }}
+                      className={`w-full bg-surface-container-high border p-3 font-sans font-semibold text-base md:text-xs   text-on-surface focus:border-primary-container outline-none transition-all ${
+                        editingArchiveEntry.type === 'BREACH' ? 'border-error/50 text-error' : 'border-white/5'
+                      }`}
+                    >
+                      <option value="COMPLETED">COMPLETED</option>
+                      <option value="INCOMPLETE">INCOMPLETE</option>
+                      <option value="BREACH">BREACH</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between p-3.5 rounded-xl bg-surface-container-high/60 border border-white/5">
+                  <div className="flex items-center gap-3">
+                    <Activity className={`w-4 h-4 ${editingArchiveEntry.cardioCompleted ? 'text-emerald-400' : 'text-primary-container'}`} />
+                    <span className="font-sans font-semibold text-xs text-on-surface">
+                      Treadmill Protocol (Cardio)
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setEditingArchiveEntry({ ...editingArchiveEntry, cardioCompleted: !editingArchiveEntry.cardioCompleted })}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold border transition-all ${
+                      editingArchiveEntry.cardioCompleted
+                        ? 'bg-emerald-500 text-black border-emerald-400'
+                        : 'bg-surface-container-highest text-on-surface-variant border-white/10 hover:border-primary-container/30'
+                    }`}
+                  >
+                    {editingArchiveEntry.cardioCompleted ? 'Completed' : 'Mark Done'}
+                  </button>
+                </div>
+
+                {editingArchiveEntry.exercises && (
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-center border-b border-white/5 pb-2">
+                      <div className="font-label text-xs text-on-surface-variant">Exercise Intel Modification</div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const allDone = (editingArchiveEntry.exercises || []).every(ex => ex.completed);
+                          const nextCompleted = !allDone;
+                          const newExercises = (editingArchiveEntry.exercises || []).map(ex => ({ ...ex, completed: nextCompleted }));
+                          setEditingArchiveEntry({
+                            ...editingArchiveEntry,
+                            exercises: newExercises,
+                            type: nextCompleted ? 'COMPLETED' : 'INCOMPLETE',
+                            cardioCompleted: nextCompleted ? true : editingArchiveEntry.cardioCompleted
+                          });
+                        }}
+                        className="px-3 py-1 rounded-lg text-[11px] font-bold bg-primary-container/10 text-primary-container border border-primary-container/30 hover:bg-primary-container/20 transition-all"
+                      >
+                        {(editingArchiveEntry.exercises || []).every(ex => ex.completed) ? 'Unmark All' : 'Mark All Completed'}
+                      </button>
+                    </div>
+                    {editingArchiveEntry.exercises.map((ex, exIdx) => (
+                      <div key={ex.id || exIdx} className={`bg-surface-container-high rounded-2xl p-4 border space-y-4 transition-colors ${ex.completed ? 'border-emerald-500/40' : 'border-white/5'}`}>
+                        <div className="flex justify-between items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const newExercises = [...(editingArchiveEntry.exercises || [])];
+                              newExercises[exIdx] = { ...ex, completed: !ex.completed };
+                              const allDone = newExercises.length > 0 && newExercises.every(item => item.completed);
+                              setEditingArchiveEntry({
+                                ...editingArchiveEntry,
+                                exercises: newExercises,
+                                type: allDone ? 'COMPLETED' : 'INCOMPLETE'
+                              });
+                            }}
+                            className={`flex items-center justify-center w-7 h-7 rounded-lg transition-all shrink-0 ${
+                              ex.completed
+                                ? 'bg-emerald-500 text-black shadow-[0_0_8px_rgba(16,185,129,0.4)]'
+                                : 'border border-primary-container/30 bg-primary-container/5 text-primary-container hover:bg-primary-container/20'
+                            }`}
+                            title={ex.completed ? 'Mark Incomplete' : 'Mark Completed'}
+                          >
+                            {ex.completed ? <CheckCircle2 className="w-4 h-4 text-black stroke-[2.5]" /> : <Check className="w-4 h-4" />}
+                          </button>
+                          <input 
+                            type="text" 
+                            value={ex.name}
+                            onChange={(e) => {
+                              const newExercises = [...(editingArchiveEntry.exercises || [])];
+                              newExercises[exIdx] = { ...ex, name: e.target.value };
+                              setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                            }}
+                            className={`bg-transparent border-b border-white/5 font-sans font-semibold font-bold text-base md:text-sm flex-grow focus:border-primary-container outline-none ${ex.completed ? 'line-through text-on-surface-variant' : 'text-on-surface'}`}
+                          />
+                          <button 
+                            onClick={() => {
+                              const newExercises = (editingArchiveEntry.exercises || []).filter((_, i) => i !== exIdx);
+                              setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                            }}
+                            className="text-error/40 hover:text-error transition-colors"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+
+                        {ex.setData ? (
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            {ex.setData.map((s, sIdx) => (
+                              <div key={sIdx} className="flex items-center gap-3 p-2 bg-surface-container-highest/20 border border-white/5 rounded">
+                                <span className="font-sans font-semibold text-xs font-bold text-primary-container">{sIdx + 1}</span>
+                                <div className="flex flex-col gap-1">
+                                  <label className="text-[6px] text-on-surface-variant/50  ">Weight</label>
+                                  <input 
+                                    type="text" 
+                                    value={s.weight}
+                                    onChange={(e) => {
+                                      const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                      const newSetData = [...(ex.setData || [])];
+                                      newSetData[sIdx] = { ...s, weight: e.target.value };
+                                      newExercises[exIdx] = { ...ex, setData: newSetData };
+                                      setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                                    }}
+                                    className="w-20 bg-surface-container-highest border border-white/5 p-2 font-mono text-base md:text-xs text-on-surface focus:border-primary-container outline-none text-center"
+                                    placeholder="Weight"
+                                  />
+                                </div>
+                                <div className="flex flex-col gap-1">
+                                  <label className="text-[6px] text-on-surface-variant/50  ">Reps</label>
+                                  <input 
+                                    type="text"
+                                    inputMode="numeric"
+                                    value={s.reps || ''}
+                                    onChange={(e) => {
+                                      const val = e.target.value === '' ? 0 : parseInt(e.target.value) || 0;
+                                      const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                      const newSetData = [...(ex.setData || [])];
+                                      newSetData[sIdx] = { ...s, reps: val };
+                                      newExercises[exIdx] = { ...ex, setData: newSetData };
+                                      setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                                    }}
+                                    className="w-16 bg-surface-container-highest border border-white/5 p-2 font-mono text-base md:text-xs text-on-surface focus:border-primary-container outline-none text-center"
+                                    placeholder="Reps"
+                                  />
+                                </div>
+                                <button 
+                                  onClick={() => {
+                                    const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                    const newSetData = (ex.setData || []).filter((_, i) => i !== sIdx);
+                                    newExercises[exIdx] = { ...ex, setData: newSetData, sets: newSetData.length.toString() };
+                                    setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                                  }}
+                                  className="mt-4 text-error/40 hover:text-error transition-colors"
+                                >
+                                  <XCircle className="w-3 h-3" />
+                                </button>
+                              </div>
+                            ))}
+                            <button 
+                              onClick={() => {
+                                const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                const newSetData = [...(ex.setData || []), { weight: ex.weight || '0', reps: ex.reps || 0 }];
+                                newExercises[exIdx] = { ...ex, setData: newSetData, sets: newSetData.length.toString() };
+                                setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                              }}
+                              className="col-span-full py-2 border border-dashed border-white/5 text-xs   text-on-surface-variant hover:bg-surface-container-highest/20 transition-all"
+                            >
+                              + Add Set
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap gap-4">
+                            <div className="flex flex-col gap-1">
+                              <label className="text-[6px] text-on-surface-variant/50  ">Sets</label>
+                              <input 
+                                type="text" 
+                                value={ex.sets}
+                                onChange={(e) => {
+                                  const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                  newExercises[exIdx] = { ...ex, sets: e.target.value };
+                                  setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                                }}
+                                className="w-16 bg-surface-container-highest border border-white/5 p-2 font-mono text-base md:text-xs text-on-surface focus:border-primary-container outline-none text-center"
+                                placeholder="Sets"
+                              />
+                            </div>
+                            <div className="flex flex-col gap-1">
+                              <label className="text-[6px] text-on-surface-variant/50  ">Weight</label>
+                              <input 
+                                type="text" 
+                                value={ex.weight}
+                                onChange={(e) => {
+                                  const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                  newExercises[exIdx] = { ...ex, weight: e.target.value };
+                                  setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                                }}
+                                className="w-24 bg-surface-container-highest border border-white/5 p-2 font-mono text-base md:text-xs text-on-surface focus:border-primary-container outline-none text-center"
+                                placeholder="Weight"
+                              />
+                            </div>
+                            <div className="flex flex-col gap-1">
+                              <label className="text-[6px] text-on-surface-variant/50  ">Reps</label>
+                              <input 
+                                type="text"
+                                inputMode="numeric"
+                                value={ex.reps || ''}
+                                onChange={(e) => {
+                                  const val = e.target.value === '' ? 0 : parseInt(e.target.value) || 0;
+                                  const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                  newExercises[exIdx] = { ...ex, reps: val };
+                                  setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                                }}
+                                className="w-16 bg-surface-container-highest border border-white/5 p-2 font-mono text-base md:text-xs text-on-surface focus:border-primary-container outline-none text-center"
+                                placeholder="Reps"
+                              />
+                            </div>
+                            <button 
+                              onClick={() => {
+                                const newExercises = [...(editingArchiveEntry.exercises || [])];
+                                const numSets = parseInt(ex.sets) || 1;
+                                const newSetData = Array.from({ length: numSets }, () => ({ weight: ex.weight, reps: ex.reps }));
+                                newExercises[exIdx] = { ...ex, setData: newSetData };
+                                setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                              }}
+                              className="mt-auto mb-1 text-xs   text-primary-container/60 hover:text-primary-container transition-colors"
+                            >
+                              Convert to Per-Set
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    <button 
+                      onClick={() => {
+                        const newExercises = [...(editingArchiveEntry.exercises || [])];
+                        newExercises.push({
+                          id: Math.random().toString(36).substr(2, 9),
+                          name: 'New Exercise',
+                          sets: '1',
+                          reps: 0,
+                          weight: '0',
+                          completed: true
+                        });
+                        setEditingArchiveEntry({ ...editingArchiveEntry, exercises: newExercises });
+                      }}
+                      className="w-full py-4 border border-dashed border-white/5 text-sm   text-primary-container hover:bg-primary-container/5 transition-all flex items-center justify-center gap-2"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Add Exercise to Entry
+                    </button>
+                  </div>
+                )}
+
+                <div className="flex gap-4 pt-4">
+                  <button 
+                    onClick={() => saveArchiveEdit(editingArchiveEntry)}
+                    className="flex-grow bg-primary-container text-on-primary-container py-4 font-sans font-semibold text-sm font-bold tracking-[0.3em]  hover:brightness-110 transition-all"
+                  >
+                    Commit Changes
+                  </button>
+                  <button 
+                    onClick={() => deleteArchiveEntry(editingArchiveEntry.id)}
+                    className="px-6 bg-error/10 text-error border border-error/20 py-4 font-sans font-semibold text-sm font-bold tracking-[0.3em]  hover:bg-error/20 transition-all"
+                  >
+                    Purge Entry
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+          {/* Roadmap Modal */}
+          <AnimatePresence>
+            {isRoadmapOpen && selectedProgramId && (
+              <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-8">
+                <motion.div 
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="absolute inset-0 bg-background/95 backdrop-blur-xl"
+                  onClick={() => setIsRoadmapOpen(false)}
+                />
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.95, y: 20 }}
+                  className="relative w-full max-w-5xl max-h-[90vh] bg-background border border-outline-variant overflow-hidden flex flex-col shadow-2xl"
+                >
+                  <div className="p-6 border-b border-outline-variant flex justify-between items-center bg-surface-container-high">
+                    <div>
+                      <span className="font-label text-primary-container text-sm tracking-[0.4em] ">Protocol Roadmap</span>
+                      <h2 className="font-sans font-semibold text-2xl font-bold text-on-surface   mt-1">
+                        {PROGRAMS.find(p => p.id === selectedProgramId)?.name}
+                      </h2>
+                    </div>
+                    <button onClick={() => setIsRoadmapOpen(false)} className="p-2 hover:bg-surface-container-highest transition-all">
+                      <XCircle className="w-6 h-6 text-on-surface-variant" />
+                    </button>
+                  </div>
+                  
+                  <div className="flex-1 overflow-y-auto p-6 custom-scrollbar">
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                      {Array.from({ length: PROGRAMS.find(p => p.id === selectedProgramId)?.totalWeeks || 0 }).map((_, i) => {
+                        const weekNum = i + 1;
+                        const program = PROGRAMS.find(p => p.id === selectedProgramId);
+                        let weekData = null;
+                        for (const range in program?.weeks) {
+                          const [start, end] = range.split('-').map(Number);
+                          if (end ? (weekNum >= start && weekNum <= end) : (weekNum === start)) {
+                            weekData = program?.weeks[range];
+                            break;
+                          }
+                        }
+                        
+                        return (
+                          <div key={weekNum} className={`relative p-6 border transition-all duration-300 ${
+                            weekNum === getProgramCurrentCycle() 
+                              ? 'border-primary-container bg-primary-container/5 shadow-[0_0_30px_rgba(0,229,255,0.05)]' 
+                              : 'border-white/10 bg-surface-container-low hover:border-white/20'
+                          }`}>
+                            <div className="flex justify-between items-center mb-6">
+                              <div className="flex flex-col">
+                                <span className="font-sans font-semibold text-2xl font-bold text-on-surface ">CYCLE {weekNum}</span>
+                                <div className="h-1 w-12 bg-primary-container mt-1" />
+                              </div>
+                              {weekNum === getProgramCurrentCycle() && (
+                                <div className="flex items-center gap-2 bg-primary-container text-on-primary-container px-3 py-1">
+                                  <Zap className="w-3 h-3 animate-pulse" />
+                                  <span className="text-sm font-bold  ">Active</span>
+                                </div>
+                              )}
+                            </div>
+                            
+                            <div className="space-y-6">
+                              {DAYS.map(day => {
+                                const exercises = weekData?.days[day] || [];
+                                if (exercises.length === 0) return null;
+                                const dayLabel = program?.dayLabels?.[day];
+                                
+                                return (
+                                  <div key={day} className="group/day">
+                                    <div className="flex items-center justify-between mb-2">
+                                      <div className="font-sans font-semibold text-sm text-on-surface-variant font-bold   group-hover/day:text-primary-container transition-colors">
+                                        {day}
+                                      </div>
+                                      {dayLabel && (
+                                        <div className="font-label text-xs text-primary-container/60 font-bold   border border-primary-container/20 px-2 py-0.5">
+                                          {dayLabel}
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div className="space-y-1.5 pl-3 border-l border-white/10 group-hover/day:border-primary-container/30 transition-colors">
+                                      {exercises.map((ex, exIdx) => (
+                                        <div key={exIdx} className="flex items-start gap-2">
+                                          <div className="w-1 h-1 rounded-full bg-primary-container/40 mt-1.5" />
+                                          <div className="flex flex-col">
+                                            <span className="text-[11px] text-on-surface font-bold  tracking-wide leading-tight">
+                                              {ex.name}
+                                            </span>
+                                            <span className="text-[9px] text-on-surface-variant/70  ">
+                                              {ex.sets}x{ex.reps} • {ex.target}
+                                            </span>
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </motion.div>
+              </div>
+            )}
+          </AnimatePresence>
+
+      {/* Program Selection Modal */}
+      <AnimatePresence>
+        {isProgramModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsProgramModalOpen(false)}
+              className="absolute inset-0 bg-background/90 backdrop-blur-xl"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-2xl bg-surface-container-low border border-primary-container/20 shadow-[0_0_50px_rgba(0,229,255,0.1)] overflow-hidden"
+            >
+              <div className="p-8 border-b border-white/5 flex justify-between items-center">
+                <div>
+                  <span className="font-label text-primary-container text-xs tracking-[0.4em] ">Selection Matrix</span>
+                  <h2 className="font-sans font-semibold text-2xl font-bold text-on-surface   mt-1">Available Programs</h2>
+                </div>
+                <button onClick={() => setIsProgramModalOpen(false)} className="text-on-surface-variant hover:text-on-surface">
+                  <XCircle className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="p-8 space-y-6 max-h-[60vh] overflow-y-auto custom-scrollbar">
+                {PROGRAMS.map(program => (
+                  <div 
+                    key={program.id}
+                    className="bg-surface-container-high rounded-2xl p-6 border border-white/5 hover:border-primary-container/30 transition-all group cursor-pointer"
+                    onClick={() => {
+                      setPendingProgramId(program.id);
+                      setIsProgramModalOpen(false);
+                      setIsScheduleConfigModalOpen(true);
+                    }}
+                  >
+                    <div className="flex justify-between items-start mb-4">
+                      <h3 className="font-sans font-semibold text-xl font-bold text-on-surface  group-hover:text-primary-container transition-colors">{program.name}</h3>
+                      <span className="font-label text-xs text-primary-container border border-primary-container/30 px-2 py-1  ">{program.author}</span>
+                    </div>
+                    <p className="text-sm text-on-surface-variant   leading-relaxed opacity-70 mb-6">
+                      {program.description}
+                    </p>
+                    <div className="flex items-center gap-2 text-primary-container font-sans font-semibold text-xs font-bold  ">
+                      Initialize Protocol <ChevronRight className="w-3 h-3" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Video Player Modal */}
+      <AnimatePresence>
+        {activeVideoUrl && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setActiveVideoUrl(null)}
+              className="absolute inset-0 bg-background/95 backdrop-blur-2xl"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="relative w-full max-w-4xl aspect-video bg-black border border-primary-container/20 shadow-[0_0_100px_rgba(0,229,255,0.2)]"
+            >
+              <button 
+                onClick={() => setActiveVideoUrl(null)}
+                className="absolute -top-12 right-0 text-on-surface-variant hover:text-on-surface flex items-center gap-2 font-sans font-semibold text-sm  "
+              >
+                Close Protocol <XCircle className="w-5 h-5" />
+              </button>
+              <iframe 
+                src={activeVideoUrl.replace('watch?v=', 'embed/')} 
+                className="w-full h-full"
+                allowFullScreen
+                title="Exercise Demonstration"
+              />
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Schedule Configuration Modal */}
+      <AnimatePresence>
+        {isScheduleConfigModalOpen && pendingProgramId && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsScheduleConfigModalOpen(false)}
+              className="absolute inset-0 bg-background/90 backdrop-blur-xl"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-2xl bg-surface-container-low border border-primary-container/20 shadow-[0_0_50px_rgba(0,229,255,0.1)] overflow-hidden"
+            >
+              <div className="p-8 border-b border-white/5 flex justify-between items-center">
+                <div>
+                  <span className="font-label text-primary-container text-xs tracking-[0.4em] ">Configuration Matrix</span>
+                  <h2 className="font-sans font-semibold text-2xl font-bold text-on-surface   mt-1">Configure Split</h2>
+                  <p className="text-sm text-on-surface-variant   mt-2 opacity-60">Map your weekly schedule to the program protocols.</p>
+                </div>
+                <button onClick={() => setIsScheduleConfigModalOpen(false)} className="text-on-surface-variant hover:text-on-surface">
+                  <XCircle className="w-6 h-6" />
+                </button>
+              </div>
+              <div className="p-8 space-y-6 max-h-[60vh] overflow-y-auto custom-scrollbar">
+                <div className="bg-surface-container-high p-6 rounded-2xl border border-white/5 space-y-4">
+                  <h3 className="font-sans font-semibold text-lg font-bold text-on-surface">Program Start Date</h3>
+                  <p className="text-sm text-on-surface-variant opacity-70">Select when this program begins. The schedule will be mapped from this date.</p>
+                  <input 
+                    type="date" 
+                    value={pendingStartDate}
+                    onChange={(e) => setPendingStartDate(e.target.value)}
+                    className="w-full bg-surface-container-low border border-white/10 p-4 font-mono text-xl text-on-surface focus:border-primary-container outline-none transition-all"
+                  />
+                </div>
+                
+                <div className="space-y-4">
+                  <h3 className="font-sans font-semibold text-lg font-bold text-on-surface">Day Mapping</h3>
+                  {DAYS.map(day => {
+                    const program = PROGRAMS.find(p => p.id === pendingProgramId);
+                    const availableDays = program?.dayLabels ? Object.keys(program.dayLabels) : DAYS;
+                    
+                    return (
+                      <div key={day} className="flex items-center justify-between p-4 bg-surface-container-high border border-white/5">
+                        <span className="font-sans font-semibold text-sm font-bold text-on-surface ">{day}</span>
+                        <select 
+                          value={dayMapping[day]}
+                          onChange={(e) => {
+                            const newMapping = { ...dayMapping, [day]: e.target.value };
+                            setDayMapping(newMapping);
+                            localStorage.setItem('sovereign_day_mapping', JSON.stringify(newMapping));
+                          }}
+                          className="bg-surface-container-low rounded-2xl border border-white/5 text-on-surface font-sans font-semibold text-sm   px-4 py-2 focus:outline-none focus:border-primary-container/50"
+                        >
+                          {availableDays.map(labelKey => (
+                            <option key={labelKey} value={labelKey}>
+                              {program?.dayLabels?.[labelKey] || labelKey}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              <div className="p-8 border-t border-white/5 flex justify-end">
+                <button 
+                  onClick={() => {
+                    const program = PROGRAMS.find(p => p.id === pendingProgramId);
+                    if (program?.weakpointOptions) {
+                      setIsScheduleConfigModalOpen(false);
+                      setIsWeakpointModalOpen(true);
+                      setSelectedProgramId(pendingProgramId);
+                      setProgramStartDate(pendingStartDate);
+                    } else {
+                      applyProgram(pendingProgramId!, null, pendingStartDate);
+                      setIsScheduleConfigModalOpen(false);
+                    }
+                  }}
+                  className="px-8 py-4 bg-primary-container text-on-primary-container font-sans font-semibold text-xs font-bold   hover:bg-primary-container/90 transition-all flex items-center gap-2"
+                >
+                  Confirm Configuration <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Weakpoint Selection Modal */}
+      <AnimatePresence>
+        {isWeakpointModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsWeakpointModalOpen(false)}
+              className="absolute inset-0 bg-background/90 backdrop-blur-xl"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-lg bg-surface-container-low border border-primary-container/20 shadow-[0_0_50px_rgba(0,229,255,0.1)] overflow-hidden"
+            >
+              <div className="p-8 border-b border-white/5">
+                <span className="font-label text-primary-container text-xs tracking-[0.4em] ">Optimization Protocol</span>
+                <h2 className="font-sans font-semibold text-2xl font-bold text-on-surface   mt-1">Select Weakpoint Focus</h2>
+                <p className="text-sm text-on-surface-variant   mt-2 opacity-60">The protocol will adjust volume to prioritize this sector.</p>
+              </div>
+              <div className="p-8 grid grid-cols-1 gap-4">
+                {PROGRAMS.find(p => p.id === selectedProgramId)?.weakpointOptions?.map(option => (
+                  <button 
+                    key={option}
+                    onClick={() => {
+                      if (selectedProgramId) {
+                        applyProgram(selectedProgramId, option);
+                        setIsWeakpointModalOpen(false);
+                      }
+                    }}
+                    className="w-full p-4 bg-surface-container-high border border-white/5 hover:border-primary-container/30 text-left group transition-all"
+                  >
+                    <div className="flex justify-between items-center">
+                      <span className="font-sans font-semibold text-sm font-bold text-on-surface  group-hover:text-primary-container transition-colors">{option} Focus</span>
+                      <div className="w-2 h-2 rounded-full border border-primary-container/30 group-hover:bg-primary-container transition-all" />
+                    </div>
+                  </button>
+                ))}
+                <button 
+                  onClick={() => {
+                    if (selectedProgramId) {
+                      applyProgram(selectedProgramId, null);
+                      setIsWeakpointModalOpen(false);
+                    }
+                  }}
+                  className="w-full p-4 border border-dashed border-white/5 text-center font-sans font-semibold text-sm   text-on-surface-variant hover:bg-surface-container-high transition-all"
+                >
+                  No Specific Focus
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Mobile Navigation */}
+      <div className="md:hidden fixed bottom-0 left-0 w-full bg-surface-container-low/90 backdrop-blur-lg border-t border-primary-container/10 flex justify-around p-4 z-50">
+        {[
+          { icon: Bolt, label: 'Quest', tab: 'Daily Quest' },
+          { icon: CalendarIcon, label: 'Schedule', tab: 'Schedule' },
+          { icon: BarChart3, label: 'Stats', tab: 'Stats' },
+          { icon: Play, label: 'Videos', tab: 'Video Library' },
+        ].map((item) => (
+          <button 
+            key={item.label} 
+            onClick={() => setActiveTab(item.tab)}
+            className={`flex flex-col items-center transition-all ${activeTab === item.tab ? 'text-primary-container scale-110' : 'text-on-surface-variant/50'}`}
+          >
+            <item.icon className={`w-5 h-5 ${activeTab === item.tab ? 'glow-primary' : ''}`} />
+            <span className="text-[7px]   mt-1 font-sans font-semibold font-bold">{item.label}</span>
+          </button>
+        ))}
+      </div>
+    </>
+  </div>
+  );
+}

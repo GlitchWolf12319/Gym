@@ -1,0 +1,65 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    // Collection: users
+    // Document ID: userId (UID)
+    // Fields:
+    //   - uid: string (required) - User's unique ID
+    //   - exp: number (required) - Total experience points
+    //   - level: number (required) - Current level
+    //   - streak: number (optional) - Current workout streak
+    //   - lastWorkoutDate: string (optional) - ISO date
+    //   - schedule: map (optional) - Weekly schedule
+    //   - completedWorkouts: list (optional) - History
+    //   - currentWeight: number (optional) - Current weight in KG
+    //   - targetWeight: number (optional) - Target weight in KG
+    //   - nutritionGoal: string (optional) - BULK, CUT, MAINTAIN
+    //   - proteinPerKg: number (optional) - Protein intensity
+    //   - nutritionStartDate: string (optional) - ISO date
+    //   - nutritionDurationWeeks: number (optional) - Duration
+    //   - calories: number (optional) - Daily calories
+    //   - isAutoCalories: bool (optional) - Auto calculation toggle
+    //   - weightHistory: list (optional) - Weight log
+    //   - updatedAt: string (optional) - Last update timestamp
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'exp', 'level']) &&
+             data.uid is string &&
+             data.exp is number &&
+             data.level is number &&
+             data.uid == request.auth.uid &&
+             (!('nutritionGoal' in data) || data.nutritionGoal in ['BULK', 'CUT', 'MAINTAIN']) &&
+             (!('currentWeight' in data) || data.currentWeight is number) &&
+             (!('targetWeight' in data) || data.targetWeight is number) &&
+             (!('proteinPerKg' in data) || data.proteinPerKg is number) &&
+             (!('calories' in data) || data.calories is number) &&
+             (!('isAutoCalories' in data) || data.isAutoCalories is bool) &&
+             (!('weightHistory' in data) || data.weightHistory is list) &&
+             (!('measurementHistory' in data) || (data.measurementHistory is list && data.measurementHistory.size() <= 1000)) &&
+             (!('measurementUnit' in data) || data.measurementUnit in ['cm', 'in']);
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) &&
+                      request.resource.data.uid == resource.data.uid;
+      allow delete: if isOwner(userId);
+    }
+  }
+}
